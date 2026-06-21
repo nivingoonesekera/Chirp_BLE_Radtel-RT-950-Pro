@@ -1,0 +1,4124 @@
+"""CHIRP driver for the Radtel RT-950 Pro over Bluetooth LE (bridged transport).
+
+Speaks the RT-950 Pro clone protocol over a serial port that is fed by
+ble_bridge.py, which carries the bytes across the radio's BLE link (paired with
+a com0com virtual COM port). See README.md for setup. For a self-contained
+variant that needs no bridge or com0com, use radtel_rt950pro_BLE_int.py.
+
+Bluetooth LE driver by Nivin Goonesekera (VK3NWG).
+Copyright (c) 2026 Nivin Goonesekera - VK3NWG. MIT License (see LICENSE).
+Based on the original USB-cable driver by Nathan Barguss (2E0NBS).
+
+EXPERIMENTAL: writing to a radio can render it inoperable. Keep a backup of your
+known-good image and use at your own risk; no warranty is offered. Load in
+CHIRP's developer mode.
+"""
+
+from __future__ import annotations
+import logging
+import random
+import unicodedata
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+import serial
+# MIT License
+#
+# Copyright (c) 2026 Nivin Goonesekera - VK3NWG
+# Portions Copyright (c) 2025 Nathan G. Barguss - 2E0NBS
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+
+"""Channel record parsing for the RT-950 Pro."""
+__all__ = [
+    "ToneMode",
+    "ToneSetting",
+    "PowerLevel",
+    "Bandwidth",
+    "Modulation",
+    "ChannelRecord",
+]
+
+LOG = logging.getLogger(__name__ + ".channel")
+
+_DCS_CODES = [
+    "D023N",
+    "D025N",
+    "D026N",
+    "D031N",
+    "D032N",
+    "D036N",
+    "D043N",
+    "D047N",
+    "D051N",
+    "D053N",
+    "D054N",
+    "D065N",
+    "D071N",
+    "D072N",
+    "D073N",
+    "D074N",
+    "D114N",
+    "D115N",
+    "D116N",
+    "D122N",
+    "D125N",
+    "D131N",
+    "D132N",
+    "D134N",
+    "D143N",
+    "D145N",
+    "D152N",
+    "D155N",
+    "D156N",
+    "D162N",
+    "D165N",
+    "D172N",
+    "D174N",
+    "D205N",
+    "D212N",
+    "D223N",
+    "D225N",
+    "D226N",
+    "D243N",
+    "D244N",
+    "D245N",
+    "D246N",
+    "D251N",
+    "D252N",
+    "D255N",
+    "D261N",
+    "D263N",
+    "D265N",
+    "D266N",
+    "D271N",
+    "D274N",
+    "D306N",
+    "D311N",
+    "D315N",
+    "D325N",
+    "D331N",
+    "D332N",
+    "D343N",
+    "D346N",
+    "D351N",
+    "D356N",
+    "D364N",
+    "D365N",
+    "D371N",
+    "D411N",
+    "D412N",
+    "D413N",
+    "D423N",
+    "D431N",
+    "D432N",
+    "D445N",
+    "D446N",
+    "D452N",
+    "D454N",
+    "D455N",
+    "D462N",
+    "D464N",
+    "D465N",
+    "D466N",
+    "D503N",
+    "D506N",
+    "D516N",
+    "D523N",
+    "D526N",
+    "D532N",
+    "D546N",
+    "D565N",
+    "D606N",
+    "D612N",
+    "D624N",
+    "D627N",
+    "D631N",
+    "D632N",
+    "D645N",
+    "D654N",
+    "D662N",
+    "D664N",
+    "D703N",
+    "D712N",
+    "D723N",
+    "D731N",
+    "D732N",
+    "D734N",
+    "D743N",
+    "D754N",
+    "D023I",
+    "D025I",
+    "D026I",
+    "D031I",
+    "D032I",
+    "D036I",
+    "D043I",
+    "D047I",
+    "D051I",
+    "D053I",
+    "D054I",
+    "D065I",
+    "D071I",
+    "D072I",
+    "D073I",
+    "D074I",
+    "D114I",
+    "D115I",
+    "D116I",
+    "D122I",
+    "D125I",
+    "D131I",
+    "D132I",
+    "D134I",
+    "D143I",
+    "D145I",
+    "D152I",
+    "D155I",
+    "D156I",
+    "D162I",
+    "D165I",
+    "D172I",
+    "D174I",
+    "D205I",
+    "D212I",
+    "D223I",
+    "D225I",
+    "D226I",
+    "D243I",
+    "D244I",
+    "D245I",
+    "D246I",
+    "D251I",
+    "D252I",
+    "D255I",
+    "D261I",
+    "D263I",
+    "D265I",
+    "D266I",
+    "D271I",
+    "D274I",
+    "D306I",
+    "D311I",
+    "D315I",
+    "D325I",
+    "D331I",
+    "D332I",
+    "D343I",
+    "D346I",
+    "D351I",
+    "D356I",
+    "D364I",
+    "D365I",
+    "D371I",
+    "D411I",
+    "D412I",
+    "D413I",
+    "D423I",
+    "D431I",
+    "D432I",
+    "D445I",
+    "D446I",
+    "D452I",
+    "D454I",
+    "D455I",
+    "D462I",
+    "D464I",
+    "D465I",
+    "D466I",
+    "D503I",
+    "D506I",
+    "D516I",
+    "D523I",
+    "D526I",
+    "D532I",
+    "D546I",
+    "D565I",
+    "D606I",
+    "D612I",
+    "D624I",
+    "D627I",
+    "D631I",
+    "D632I",
+    "D645I",
+    "D654I",
+    "D662I",
+    "D664I",
+    "D703I",
+    "D712I",
+    "D723I",
+    "D731I",
+    "D732I",
+    "D734I",
+    "D743I",
+    "D754I",
+]
+
+class ToneMode(Enum):
+    """Enumeration of tone encoding modes used by a channel slot."""
+
+    OFF = "off"
+    CTCSS = "ctcss"
+    DCS = "dcs"
+
+@dataclass(slots=True)
+class ToneSetting:
+    """Represents the transmit or receive tone configuration for a channel."""
+
+    mode: ToneMode
+    ctcss_hz: Optional[float] = None
+    dcs_code: Optional[int] = None
+    dcs_polarity: Optional[str] = None
+    _raw_bytes: bytes = field(default=b"", repr=False, compare=False)
+    _original_state: Optional[tuple] = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self._original_state is None:
+            object.__setattr__(self, "_original_state", self._state_tuple())
+
+    def _state_tuple(self) -> tuple:
+        return (
+            self.mode,
+            self.ctcss_hz,
+            self.dcs_code,
+            self.dcs_polarity,
+        )
+
+    @property
+    def is_off(self) -> bool:
+        """Return ``True`` when the tone is disabled."""
+
+        return self.mode is ToneMode.OFF
+
+    @classmethod
+    def off(cls) -> "ToneSetting":
+        """Build a tone setting with no encode/decode tones."""
+
+        return cls(ToneMode.OFF)
+
+    @classmethod
+    def ctcss(cls, hz: float) -> "ToneSetting":
+        """Build a CTCSS tone definition from the provided frequency."""
+
+        return cls(ToneMode.CTCSS, ctcss_hz=hz)
+
+    @classmethod
+    def dcs(cls, code: int, polarity: str) -> "ToneSetting":
+        """Build a DCS tone definition with the supplied code and polarity."""
+
+        return cls(ToneMode.DCS, dcs_code=code, dcs_polarity=polarity.upper())
+
+    def to_display(self) -> str:
+        """Return a human-readable representation of the tone setting."""
+
+        if self.mode is ToneMode.OFF:
+            return "OFF"
+        if self.mode is ToneMode.CTCSS and self.ctcss_hz is not None:
+            return f"{self.ctcss_hz:.1f}"
+        if self.mode is ToneMode.DCS and self.dcs_code is not None and self.dcs_polarity:
+            return f"D{self.dcs_code:03}{self.dcs_polarity.upper()}"
+        return "OFF"
+
+    def to_bytes(self) -> bytes:
+        """Encode the tone information into the radio's two-byte format."""
+
+        current_state = self._state_tuple()
+        if (
+            self._original_state is not None
+            and current_state == self._original_state
+            and self._raw_bytes
+        ):
+            return self._raw_bytes
+
+        if self.mode is ToneMode.OFF:
+            result = b"\x00\x00"
+        elif self.mode is ToneMode.DCS and self.dcs_code is not None and self.dcs_polarity:
+            token = f"D{self.dcs_code:03}{self.dcs_polarity.upper()}"
+            try:
+                index = _DCS_CODES.index(token)
+            except ValueError as exc:
+                raise ValueError(f"Unsupported DCS code {token}") from exc
+            result = bytes((index + 1, 0x00))
+        elif self.mode is ToneMode.CTCSS and self.ctcss_hz is not None:
+            value = int(round(self.ctcss_hz * 10))
+            if value <= 0 or value > 0xFFFF:
+                raise ValueError(f"CTCSS value out of range: {self.ctcss_hz}")
+            result = bytes((value & 0xFF, (value >> 8) & 0xFF))
+        else:
+            result = b"\x00\x00"
+
+        object.__setattr__(self, "_raw_bytes", result)
+        object.__setattr__(self, "_original_state", current_state)
+        return result
+
+    @staticmethod
+    def from_bytes(raw: bytes) -> "ToneSetting":
+        """Decode a two-byte tone structure into a :class:`ToneSetting`."""
+
+        if len(raw) != 2:
+            raise ValueError("Tone bytes must be length 2")
+        first, second = raw
+        if first == 0 and second == 0:
+            setting = ToneSetting.off()
+        elif second == 0:
+            index = first
+            if 1 <= index <= len(_DCS_CODES):
+                token = _DCS_CODES[index - 1]
+                code = int(token[1:4])
+                polarity = token[4]
+                setting = ToneSetting.dcs(code, polarity)
+            else:
+                LOG.warning("Unknown DCS index %s", index)
+                setting = ToneSetting.off()
+        else:
+            value = (second << 8) | first
+            if value == 0xFFFF:
+                setting = ToneSetting.off()
+            else:
+                hz = value / 10.0
+                setting = ToneSetting.ctcss(hz)
+
+        object.__setattr__(setting, "_raw_bytes", bytes(raw))
+        object.__setattr__(setting, "_original_state", setting._state_tuple())
+        return setting
+
+class PowerLevel(Enum):
+    """Output power selections available to the channel."""
+
+    HIGH = 0
+    MEDIUM = 1
+    LOW = 2
+
+class Bandwidth(Enum):
+    """Bandwidth choices that control FM deviation."""
+
+    NARROW = 0
+    WIDE = 1
+
+class Modulation(Enum):
+    """Receive modulation mode of the channel."""
+
+    FM = 0
+    AM = 1
+
+@dataclass(slots=True)
+class ChannelRecord:
+    """High-level representation of a 32-byte channel structure."""
+
+    rx_hz: Optional[int]
+    tx_hz: Optional[int]
+    rx_tone: ToneSetting
+    tx_tone: ToneSetting
+    signalling_group: int
+    ptt_id: int
+    power: PowerLevel
+    scrambler: int
+    learn_fhss: bool
+    bandwidth: Bandwidth
+    encryption: int
+    busy_lockout: bool
+    scan_add: bool
+    tx_enabled: bool
+    rx_modulation: Modulation
+    fhss_code: Optional[str]
+    name: str
+    _raw_bytes: bytes = field(default=b"", repr=False, compare=False)
+    _original_state: Optional[tuple] = field(default=None, repr=False, compare=False)
+
+    @classmethod
+    def from_bytes(cls, data: bytes, *, logger: Optional[logging.Logger] = None) -> "ChannelRecord":
+        """Parse a raw 32-byte channel record into a :class:`ChannelRecord`."""
+
+        if len(data) != 32:
+            raise ValueError("Channel record must be exactly 32 bytes")
+        logger = logger or LOG
+        rx_hz = _decode_frequency(data[0:4])
+        tx_hz = _decode_frequency(data[4:8])
+        rx_tone = ToneSetting.from_bytes(data[8:10])
+        tx_tone = ToneSetting.from_bytes(data[10:12])
+        signalling_group = data[12] & 0x0F
+        ptt_id = data[13] & 0x0F
+        power = PowerLevel(min(data[14] & 0x0F, 2))
+        scrambler = (data[14] >> 4) & 0x0F
+        flags = data[15]
+        learn_fhss = bool(flags & 0x80)
+        # Radio uses bit6: 1 = NARROW, 0 = WIDE
+        bandwidth = Bandwidth.NARROW if ((flags >> 6) & 0x01) else Bandwidth.WIDE
+        encryption = (flags >> 4) & 0x03
+        busy_lockout = bool(flags & 0x08)
+        scan_add = bool(flags & 0x04)
+        tx_enabled = bool(flags & 0x02)
+        rx_modulation = Modulation(flags & 0x01)
+        fhss_code = _decode_fhss_code(data[16:20])
+        name = _decode_name(data[20:32], logger)
+        record = cls(
+            rx_hz=rx_hz,
+            tx_hz=tx_hz,
+            rx_tone=rx_tone,
+            tx_tone=tx_tone,
+            signalling_group=signalling_group,
+            ptt_id=ptt_id,
+            power=power,
+            scrambler=scrambler,
+            learn_fhss=learn_fhss,
+            bandwidth=bandwidth,
+            encryption=encryption,
+            busy_lockout=busy_lockout,
+            scan_add=scan_add,
+            tx_enabled=tx_enabled,
+            rx_modulation=rx_modulation,
+            fhss_code=fhss_code,
+            name=name,
+        )
+        record._raw_bytes = bytes(data)
+        record._original_state = record._state_tuple()
+        return record
+
+    def to_bytes(self, *, logger: Optional[logging.Logger] = None) -> bytes:
+        """Serialise the record back into the radio's 32-byte format."""
+
+        logger = logger or LOG
+
+        current_state = self._state_tuple()
+        if self._original_state is not None and current_state == self._original_state:
+            if self._raw_bytes:
+                return self._raw_bytes
+
+        buf = bytearray(b"\xFF" * 32)
+        buf[0:4] = _encode_frequency(self.rx_hz)
+        buf[4:8] = _encode_frequency(self.tx_hz)
+        buf[8:10] = self.rx_tone.to_bytes()
+        buf[10:12] = self.tx_tone.to_bytes()
+        buf[12] = self.signalling_group & 0x0F
+        buf[13] = self.ptt_id & 0x0F
+        scram = self.scrambler & 0x0F
+        power_value = self.power.value & 0x0F
+        buf[14] = (scram << 4) | power_value
+        flags = 0
+        if self.learn_fhss:
+            flags |= 0x80
+        # Radio uses bit6: 1 = NARROW, 0 = WIDE
+        if self.bandwidth is Bandwidth.NARROW:
+            flags |= 0x40
+        flags |= (self.encryption & 0x03) << 4
+        if self.busy_lockout:
+            flags |= 0x08
+        if self.scan_add:
+            flags |= 0x04
+        if self.tx_enabled:
+            flags |= 0x02
+        if self.rx_modulation is Modulation.AM:
+            flags |= 0x01
+        buf[15] = flags
+        buf[16:20] = _encode_fhss_code(self.fhss_code)
+        buf[20:32] = _encode_name(self.name, logger)
+        result = bytes(buf)
+        self._raw_bytes = result
+        self._original_state = current_state
+        return result
+
+    def _state_tuple(self) -> tuple:
+        return (
+            self.rx_hz,
+            self.tx_hz,
+            self.rx_tone._state_tuple(),
+            self.tx_tone._state_tuple(),
+            self.signalling_group,
+            self.ptt_id,
+            self.power,
+            self.scrambler,
+            self.learn_fhss,
+            self.bandwidth,
+            self.encryption,
+            self.busy_lockout,
+            self.scan_add,
+            self.tx_enabled,
+            self.rx_modulation,
+            self.fhss_code,
+            self.name,
+        )
+
+def _decode_frequency(raw: bytes) -> Optional[int]:
+    """Translate a four-byte packed BCD frequency into Hertz."""
+
+    if len(raw) != 4:
+        raise ValueError("Frequency field must be 4 bytes")
+    if all(b in (0x00, 0xFF) for b in raw):
+        return None
+    digits = []
+    for byte in raw:
+        high = (byte >> 4) & 0x0F
+        low = byte & 0x0F
+        if high > 9 or low > 9:
+            raise ValueError(f"Invalid BCD digit in frequency byte {byte:02X}")
+        digits.append(high * 10 + low)
+    value = 0
+    for chunk in reversed(digits):
+        value = value * 100 + chunk
+    return value * 10
+
+def _encode_frequency(hz: Optional[int]) -> bytes:
+    """Pack an integer frequency in Hertz into the four-byte BCD layout."""
+
+    if hz is None or hz == 0:
+        return b"\xFF" * 4
+    if hz % 10 != 0:
+        raise ValueError("Frequency must align to 10 Hz steps")
+    value = hz // 10
+    digits = []
+    for _ in range(4):
+        digits.append(value % 100)
+        value //= 100
+    if value:
+        raise ValueError("Frequency value exceeds 32-bit packed BCD range")
+    out = bytearray()
+    for chunk in digits:
+        high = chunk // 10
+        low = chunk % 10
+        out.append((high << 4) | low)
+    return bytes(out)
+
+def _decode_fhss_code(raw: bytes) -> Optional[str]:
+    """Extract the six-character FHSS identifier from its four-byte field."""
+
+    if len(raw) != 4:
+        raise ValueError("FHSS field must be 4 bytes")
+    if raw[3] != 0xA0:
+        return None
+    digits = "0123456789ABCDEF"
+    parts = []
+    for byte in reversed(raw[:3]):
+        parts.append(digits[(byte >> 4) & 0x0F])
+        parts.append(digits[byte & 0x0F])
+    return "".join(parts)
+
+def _encode_fhss_code(code: Optional[str]) -> bytes:
+    """Encode the FHSS identifier into the radio's storage format."""
+
+    buf = bytearray(b"\xFF\xFF\xFF\xFF")
+    if not code:
+        return bytes(buf)
+    token = code.strip().upper()
+    if len(token) != 6 or any(c not in "0123456789ABCDEF" for c in token):
+        raise ValueError(f"FHSS code must be 6 hex characters: {code}")
+    buf[3] = 0xA0
+    digits = "0123456789ABCDEF"
+    buf[2] = (digits.index(token[0]) << 4) | digits.index(token[1])
+    buf[1] = (digits.index(token[2]) << 4) | digits.index(token[3])
+    buf[0] = (digits.index(token[4]) << 4) | digits.index(token[5])
+    return bytes(buf)
+
+def _decode_name(raw: bytes, logger: logging.Logger) -> str:
+    """Decode a GB2312-encoded channel name from the twelve-byte field."""
+
+    data = bytearray()
+    for byte in raw:
+        if byte in (0xFF, 0x00):
+            break
+        data.append(byte)
+    if not data:
+        return ""
+    try:
+        return data.decode("gb2312")
+    except UnicodeDecodeError:
+        name = data.decode("gb2312", errors="replace")
+        logger.warning("Channel name contained invalid GB2312 bytes: %s", data.hex())
+        return name
+
+def _encode_name(name: str, logger: logging.Logger) -> bytes:
+    """Encode a display name using GB2312 with logged fallbacks when needed."""
+
+    if not name:
+        return b"\xFF" * 12
+    working = name
+    try:
+        working.encode("gb2312")
+    except UnicodeEncodeError:
+        normalised = unicodedata.normalize("NFKD", working)
+        ascii_only = normalised.encode("ascii", errors="ignore").decode("ascii")
+        if not ascii_only:
+            ascii_only = normalised.encode("gb2312", errors="ignore").decode("gb2312", errors="ignore")
+        logger.warning(
+            "Channel name '%s' contains non-GB2312 characters; stored as '%s'",
+            name,
+            ascii_only,
+        )
+        working = ascii_only
+    encoded = bytearray()
+    for char in working:
+        try:
+            char_bytes = char.encode("gb2312")
+        except UnicodeEncodeError:
+            logger.warning(
+                "Dropping character '%s' from channel name '%s' during encoding",
+                char,
+                name,
+            )
+            continue
+        if len(encoded) + len(char_bytes) > 12:
+            logger.warning("Channel name '%s' truncated to 12 bytes", name)
+            break
+        encoded.extend(char_bytes)
+    while len(encoded) < 12:
+        encoded.append(0xFF)
+    return bytes(encoded[:12])
+
+# MIT License
+#
+# Copyright (c) 2026 Nivin Goonesekera - VK3NWG
+# Portions Copyright (c) 2025 Nathan G. Barguss - 2E0NBS
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+
+"""Parsed data structures and codecs for RT-950 Pro clone sections."""
+
+__all__ = [
+    "VFOSettings",
+    "FunctionSettings",
+    "DTMFSettings",
+    "ModulationChannelEntry",
+    "ModulationSettings",
+    "APRSSettings",
+    "parse_vfo_section",
+    "parse_function_section",
+    "parse_dtmf_section",
+    "parse_modulation_sections",
+    "parse_aprs_section",
+    "encode_vfo_section",
+    "encode_function_section",
+    "encode_dtmf_section",
+    "encode_modulation_sections",
+    "encode_aprs_section",
+]
+
+_DTMF_DIGITS = "0123456789ABCD*#"
+
+@dataclass(slots=True)
+class VFOSettings:
+    """Decoded VFO entry."""
+
+    rx_hz: Optional[int]
+    offset_hz: Optional[int]
+    rx_tone: ToneSetting
+    tx_tone: ToneSetting
+    busy_lockout: bool
+    offset_direction: int
+    signalling_group: int
+    tx_power: PowerLevel
+    scrambler: int
+    learn_fhss: bool
+    bandwidth: Bandwidth
+    encryption: int
+    rx_modulation: Modulation
+    freq_band: int
+    step_freq_index: int
+    _raw_bytes: bytes = field(default=b"", repr=False, compare=False)
+    _original_state: Optional[tuple] = field(default=None, repr=False, compare=False)
+
+    def _state_tuple(self) -> tuple:
+        return (
+            self.rx_hz,
+            self.offset_hz,
+            self.rx_tone._state_tuple(),
+            self.tx_tone._state_tuple(),
+            self.busy_lockout,
+            self.offset_direction,
+            self.signalling_group,
+            self.tx_power,
+            self.scrambler,
+            self.learn_fhss,
+            self.bandwidth,
+            self.encryption,
+            self.rx_modulation,
+            self.freq_band,
+            self.step_freq_index,
+        )
+
+@dataclass(slots=True)
+class FunctionSettings:
+    """Flat mapping of function configuration values."""
+
+    values: Dict[str, Optional[int]] = field(default_factory=dict)
+
+@dataclass(slots=True)
+class DTMFSettings:
+    """Decoded DTMF settings and code groups."""
+
+    current_id: str
+    ptt_id_mode: Optional[int]
+    last_time_send: Optional[int]
+    last_time_stop: Optional[int]
+    code_groups: List[str]
+
+@dataclass(slots=True)
+class ModulationChannelEntry:
+    """Single modulation channel entry across FM/AM/SSB."""
+
+    fm_frequency: Optional[int]
+    fm_name: str
+    am_frequency: Optional[int]
+    am_name: str
+    ssb_frequency: Optional[int]
+    ssb_bandwidth: Optional[int]
+    ssb_beat_offset: Optional[int]
+    ssb_name: str
+
+@dataclass(slots=True)
+class ModulationSettings:
+    """Full modulation section contents."""
+
+    fm_current_channel: Optional[int]
+    am_current_channel: Optional[int]
+    ssb_current_channel: Optional[int]
+    work_mode: Optional[int]
+    modulation_mode: Optional[int]
+    am_step_index: Optional[int]
+    am_rx_gain: Optional[int]
+    ssb_step_index: Optional[int]
+    ssb_rx_gain: Optional[int]
+    channels: List[ModulationChannelEntry]
+
+@dataclass(slots=True)
+class APRSSettings:
+    """Decoded APRS settings."""
+
+    fields: Dict[str, Optional[object]] = field(default_factory=dict)
+
+def parse_vfo_section(section: bytes) -> List[VFOSettings]:
+    if len(section) % 32 != 0:
+        raise ValueError("VFO section must be a multiple of 32 bytes")
+    entries: List[VFOSettings] = []
+    for offset in range(0, len(section), 32):
+        chunk = section[offset : offset + 32]
+        rx_hz = _decode_vfo_frequency(chunk[0:8])
+        rx_tone = ToneSetting.from_bytes(bytes(chunk[8:10]))
+        tx_tone = ToneSetting.from_bytes(bytes(chunk[10:12]))
+        busy_lockout = bool(chunk[13] & 0x01)
+        offset_dir = (chunk[14] >> 4) & 0x03
+        signalling_group = chunk[14] & 0x0F
+        tx_power_raw = chunk[16] & 0x0F
+        tx_power = PowerLevel(min(tx_power_raw, PowerLevel.HIGH.value))
+        scrambler = (chunk[16] >> 4) & 0x0F
+        learn_fhss = bool((chunk[17] >> 7) & 0x01)
+        # Radio uses bit6: 1 = NARROW, 0 = WIDE
+        bandwidth = Bandwidth.NARROW if ((chunk[17] >> 6) & 0x01) else Bandwidth.WIDE
+        encryption = (chunk[17] >> 4) & 0x03
+        rx_modulation = Modulation.AM if (chunk[17] & 0x01) else Modulation.FM
+        freq_band = chunk[18] & 0x0F
+        step_freq = chunk[19] & 0x0F
+        offset_hz = _decode_offset_frequency(chunk[20:27])
+        entry = VFOSettings(
+            rx_hz=rx_hz,
+            offset_hz=offset_hz,
+            rx_tone=rx_tone,
+            tx_tone=tx_tone,
+            busy_lockout=busy_lockout,
+            offset_direction=offset_dir,
+            signalling_group=signalling_group,
+            tx_power=tx_power,
+            scrambler=scrambler,
+            learn_fhss=learn_fhss,
+            bandwidth=bandwidth,
+            encryption=encryption,
+            rx_modulation=rx_modulation,
+            freq_band=freq_band,
+            step_freq_index=step_freq,
+        )
+        entry._raw_bytes = bytes(chunk)
+        entry._original_state = entry._state_tuple()
+        entries.append(entry)
+    return entries
+
+def parse_function_section(section: bytes) -> FunctionSettings:
+    if len(section) != 96:
+        raise ValueError("Function config section must be 96 bytes")
+    part1 = section[0:32]
+    part2 = section[32:64]
+    part3 = section[64:96]
+    values: Dict[str, Optional[int]] = {}
+
+    def _masked(byte: int, mask: int = 0x0F, shift: int = 0) -> Optional[int]:
+        if byte == 0xFF:
+            return None
+        return (byte >> shift) & mask
+
+    def _set(name: str, byte: int, mask: int = 0x0F, shift: int = 0) -> None:
+        values[name] = _masked(byte, mask, shift)
+
+    _set("sql", part1[0])
+    _set("save_mode", part1[1])
+    _set("vox", part1[2])
+    _set("auto_backlight", part1[3])
+    _set("tdr", part1[4])
+    _set("tot", part1[5])
+    _set("beep_prompt", part1[6])
+    _set("voice_prompt", part1[7])
+    _set("language", part1[8])
+    _set("dtmf_mode", part1[9])
+    _set("scan_mode", part1[10])
+    _set("ptt_id", part1[11])
+    _set("send_id_delay", part1[12])
+    _set("display_mode_a", part1[13])
+    _set("display_mode_b", part1[14])
+    _set("display_mode_c", part1[15])
+    _set("auto_key_lock", part1[16])
+    _set("alarm_mode", part1[17])
+    _set("alarm_sound", part1[18])
+    _set("tail_noise_clear", part1[20])
+    _set("pass_repeater_noise_clear", part1[21])
+    _set("pass_repeater_noise_detect", part1[22])
+    _set("sound_tx_end", part1[23])
+    _set("current_work_mode", part1[24])
+    _set("fm_radio", part1[25])
+    if part1[26] == 0xFF:
+        values["work_mode_a"] = None
+        values["work_mode_b"] = None
+        values["work_mode_c"] = None
+    else:
+        values["work_mode_a"] = part1[26] & 0x03
+        values["work_mode_b"] = (part1[26] >> 2) & 0x03
+        values["work_mode_c"] = (part1[26] >> 4) & 0x03
+    _set("lock_keyboard", part1[27])
+    _set("power_on_message", part1[28])
+    _set("bt_write_switch", part1[29])
+    _set("rtone", part1[30])
+
+    _set("vox_delay", part2[0])
+    _set("timer_menu_quit", part2[1])
+    _set("weather_channel", part2[5])
+    _set("divide_channel", part2[6])
+    _set("subaudio_scan_save", part2[7])
+    _set("vox_switch", part2[8])
+    _set("key_side1_short", part2[9])
+    _set("key_side1_long", part2[10])
+    _set("key_side2_short", part2[11])
+    _set("key_side2_long", part2[12])
+    _set("current_work_area_a", part2[13])
+    _set("current_work_area_b", part2[14])
+    _set("current_work_area_c", part2[15])
+    _set("ab_uv_transfer", part2[25])
+    _set("sound_transfer", part2[26])
+    _set("key0_long", part2[27], mask=0x1F)
+    _set("key1_long", part2[28], mask=0x1F)
+    _set("key2_long", part2[29], mask=0x1F)
+    _set("key3_long", part2[30], mask=0x1F)
+    _set("key4_long", part2[31], mask=0x1F)
+
+    _set("key5_long", part3[0], mask=0x1F)
+    _set("key6_long", part3[1], mask=0x1F)
+    _set("key7_long", part3[2], mask=0x1F)
+    _set("key8_long", part3[3], mask=0x1F)
+    _set("key9_long", part3[4], mask=0x1F)
+
+    return FunctionSettings(values=values)
+
+def parse_dtmf_section(section: bytes) -> DTMFSettings:
+    if len(section) != 384:
+        raise ValueError("DTMF section must be 384 bytes")
+    info = section[0:32]
+    groups = section[32:]
+    current_id = _decode_dtmf_sequence(info[0:5])
+    ptt_id = info[6] & 0x0F if info[6] != 0xFF else None
+    last_send = info[7] & 0x0F if info[7] != 0xFF else None
+    last_stop = info[8] & 0x0F if info[8] != 0xFF else None
+    code_groups: List[str] = []
+    for offset in range(0, len(groups), 16):
+        code_groups.append(_decode_dtmf_sequence(groups[offset : offset + 16], max_len=6))
+    return DTMFSettings(
+        current_id=current_id,
+        ptt_id_mode=ptt_id,
+        last_time_send=last_send,
+        last_time_stop=last_stop,
+        code_groups=code_groups,
+    )
+
+def parse_modulation_sections(mod_block: bytes, name_block: bytes) -> ModulationSettings:
+    if len(mod_block) != 256:
+        raise ValueError("Modulation parameter block must be 256 bytes")
+    if len(name_block) != 768:
+        raise ValueError("Modulation name block must be 768 bytes")
+
+    channels: List[ModulationChannelEntry] = []
+
+    def _optional(value: int, modulus: int) -> Optional[int]:
+        if value == 0xFF:
+            return None
+        return value % modulus
+
+    fm_freqs = [_decode_le_uint16(mod_block, idx * 2) for idx in range(16)]
+    fm_current = _optional(mod_block[32], 15)
+    work_mode = _optional(mod_block[33], 2)
+    am_freqs = [_decode_le_uint16(mod_block, 34 + idx * 2) for idx in range(16)]
+    am_current = _optional(mod_block[66], 15)
+    modulation_mode = _optional(mod_block[67], 5)
+    am_rx_gain = _optional(mod_block[68], 37)
+    ssb_freqs = []
+    ssb_bandwidths = []
+    ssb_offsets = []
+    for idx in range(16):
+        base = 69 + idx * 5
+        ssb_freqs.append(_decode_le_uint16(mod_block, base))
+        ssb_bandwidths.append(mod_block[base + 2])
+        ssb_offsets.append(_decode_le_int16(mod_block, base + 3))
+    ssb_current = _optional(mod_block[149], 15)
+    ssb_step = _optional(mod_block[150], 6)
+    am_step = _optional(mod_block[151], 4)
+    ssb_rx_gain = _optional(mod_block[152], 37)
+
+    fm_names = [_decode_gb2312(name_block, idx * 16) for idx in range(16)]
+    am_names = [_decode_gb2312(name_block, 256 + idx * 16) for idx in range(16)]
+    ssb_names = [_decode_gb2312(name_block, 512 + idx * 16) for idx in range(16)]
+
+    def _scale_freq(value: int) -> Optional[int]:
+        if value in (0, 0xFFFF):
+            return None
+        return value * 10_000
+
+    for idx in range(16):
+        fm_freq = _scale_freq(fm_freqs[idx])
+        am_freq = _scale_freq(am_freqs[idx])
+        ssb_freq = _scale_freq(ssb_freqs[idx])
+        channels.append(
+            ModulationChannelEntry(
+                fm_frequency=fm_freq,
+                fm_name=fm_names[idx],
+                am_frequency=am_freq,
+                am_name=am_names[idx],
+                ssb_frequency=ssb_freq,
+                ssb_bandwidth=None if ssb_bandwidths[idx] in (0, 0xFF) else int(ssb_bandwidths[idx]),
+                ssb_beat_offset=ssb_offsets[idx] if ssb_freq is not None else None,
+                ssb_name=ssb_names[idx],
+            )
+        )
+
+    return ModulationSettings(
+        fm_current_channel=fm_current,
+        am_current_channel=am_current,
+        ssb_current_channel=ssb_current,
+        work_mode=work_mode,
+        modulation_mode=modulation_mode,
+        am_step_index=am_step,
+        am_rx_gain=am_rx_gain,
+        ssb_step_index=ssb_step,
+        ssb_rx_gain=ssb_rx_gain,
+        channels=channels,
+    )
+
+def parse_aprs_section(section: bytes) -> APRSSettings:
+    if len(section) != 128:
+        raise ValueError("APRS section must be 128 bytes")
+    data = section
+    fields: Dict[str, Optional[object]] = {}
+
+    def _set(name: str, idx: int, mask: int = 0x0F) -> None:
+        byte = data[idx]
+        if byte == 0xFF:
+            fields[name] = None
+        else:
+            fields[name] = byte & mask
+
+    _set("aprs_switch", 0)
+    _set("gps_switch", 1)
+    _set("latlon_unit", 2)
+    _set("speed_unit", 3)
+    _set("distance_unit", 4)
+    _set("altitude_unit", 5)
+    _set("time_zone", 6, mask=0x1F)
+    north_byte = data[7]
+    if north_byte == 0xFF:
+        fields["north_south"] = None
+    else:
+        fields["north_south"] = 0 if north_byte == 0x4E else 1
+    fields["latitude_minute"] = None if data[8] == 0xFF else min(59, data[8])
+    fields["latitude_degree"] = None if data[9] == 0xFF else min(90, data[9])
+    fields["latitude_second"] = None if data[10] == 0xFF else min(59, data[10])
+    east_byte = data[11]
+    if east_byte == 0xFF:
+        fields["east_west"] = None
+    else:
+        fields["east_west"] = 0 if east_byte == 0x57 else 1
+    fields["longitude_minute"] = None if data[12] == 0xFF else min(59, data[12])
+    fields["longitude_degree"] = None if data[13] == 0xFF else min(180, data[13])
+    fields["longitude_second"] = None if data[14] == 0xFF else min(59, data[14])
+    alt_bytes = data[15:17]
+    if all(b == 0xFF for b in alt_bytes):
+        fields["altitude"] = None
+    else:
+        altitude = int.from_bytes(bytes(alt_bytes), "little", signed=True)
+        fields["altitude"] = max(-10000, min(10000, altitude))
+
+    fields["call_sign"] = _decode_ascii(data, 17, 6)
+    _set("ssid", 23)
+    _set("routing_select", 24)
+    _set("my_position", 25)
+    _set("radio_symbol", 26)
+    if data[27] == 0xFF:
+        fields["user_defined_icon"] = None
+    else:
+        fields["user_defined_icon"] = data[27] & 0x7F
+    _set("aprs_priority", 29)
+    _set("data_tx_delay", 30)
+    _set("aprs_decode_prompt_tone", 32)
+    _set("aprs_rx_auto_popup", 33)
+    _set("beacon_tx_type", 34)
+    _set("timed_beacon_time", 36)
+    _set("mice_type", 38)
+    _set("tnc_data_type", 39)
+    _set("aprs_forward_channel", 40)
+    _set("aprs_forward_routing", 41)
+    _set("aprs_wait_forward", 42)
+    fields["custom_routing_one"] = _decode_ascii(data, 43, 6)
+    _set("custom_routing_one_ssid", 49)
+    fields["custom_routing_two"] = _decode_ascii(data, 50, 6)
+    _set("custom_routing_two_ssid", 56)
+    _set("send_custom_messages", 78)
+    fields["custom_messages"] = _decode_gb2312(data, 79, max_len=40)
+
+    return APRSSettings(fields=fields)
+
+# ---------------------------------------------------------------------------
+# Encoding helpers
+# ---------------------------------------------------------------------------
+
+def encode_vfo_section(vfos: Optional[List[VFOSettings]], raw: Optional[bytes]) -> bytes:
+    """Encode the VFO section into its 96-byte representation."""
+
+    if raw and len(raw) == 96:
+        buffer = bytearray(raw)
+    else:
+        buffer = bytearray(b"\xFF" * 96)
+    if not vfos:
+        return bytes(buffer)
+    mv = memoryview(buffer)
+    for idx, entry in enumerate(vfos[:3]):
+        start = idx * 32
+        current_state = entry._state_tuple()
+        if (
+            entry._original_state is not None
+            and current_state == entry._original_state
+            and entry._raw_bytes
+        ):
+            mv[start : start + 32] = entry._raw_bytes
+            continue
+        source = (
+            entry._raw_bytes if len(entry._raw_bytes) == 32 else bytes(mv[start : start + 32])
+        )
+        chunk = bytearray(source)
+        if entry.rx_hz is not None:
+            chunk[0:8] = _encode_vfo_frequency(entry.rx_hz)
+        chunk[8:10] = entry.rx_tone.to_bytes()
+        chunk[10:12] = entry.tx_tone.to_bytes()
+        base13 = 0 if chunk[13] == 0xFF else chunk[13] & ~0x01
+        chunk[13] = base13 | (0x01 if entry.busy_lockout else 0x00)
+        preserved14 = 0 if chunk[14] == 0xFF else chunk[14] & 0xC0
+        chunk[14] = (
+            preserved14
+            | ((entry.offset_direction & 0x03) << 4)
+            | (entry.signalling_group & 0x0F)
+        )
+        chunk[16] = ((entry.scrambler & 0x0F) << 4) | (entry.tx_power.value & 0x0F)
+        flags = 0 if chunk[17] == 0xFF else chunk[17] & ~(0x80 | 0x40 | 0x30 | 0x01)
+        if entry.learn_fhss:
+            flags |= 0x80
+        # Radio uses bit6: 1 = NARROW, 0 = WIDE
+        if entry.bandwidth is Bandwidth.NARROW:
+            flags |= 0x40
+        flags |= (entry.encryption & 0x03) << 4
+        if entry.rx_modulation is Modulation.AM:
+            flags |= 0x01
+        chunk[17] = flags
+        preserved18 = 0 if chunk[18] == 0xFF else chunk[18] & 0xF0
+        chunk[18] = preserved18 | (entry.freq_band & 0x0F)
+        preserved19 = 0 if chunk[19] == 0xFF else chunk[19] & 0xF0
+        chunk[19] = preserved19 | (entry.step_freq_index & 0x0F)
+        if entry.offset_hz is not None:
+            chunk[20:27] = _encode_offset_frequency(entry.offset_hz)
+        encoded = bytes(chunk)
+        mv[start : start + 32] = encoded
+        entry._raw_bytes = encoded
+        entry._original_state = entry._state_tuple()
+    return bytes(buffer)
+
+def encode_function_section(settings: Optional[FunctionSettings], raw: Optional[bytes]) -> bytes:
+    """Serialise the 96-byte function configuration block."""
+
+    if raw and len(raw) == 96:
+        buffer = bytearray(raw)
+    else:
+        buffer = bytearray(b"\xFF" * 96)
+    if settings is None:
+        return bytes(buffer)
+    part1 = memoryview(buffer)[0:32]
+    part2 = memoryview(buffer)[32:64]
+    part3 = memoryview(buffer)[64:96]
+    values = settings.values
+
+    def _set(part: memoryview, index: int, key: str, mask: int = 0x0F, shift: int = 0) -> None:
+        value = values.get(key)
+        if value is None:
+            part[index] = 0xFF
+            return
+        encoded = (int(value) & mask) << shift
+        current = part[index]
+        if current == 0xFF:
+            base = 0
+        else:
+            base = current & ~(mask << shift)
+        part[index] = base | encoded
+
+    _set(part1, 0, "sql")
+    _set(part1, 1, "save_mode")
+    _set(part1, 2, "vox")
+    _set(part1, 3, "auto_backlight")
+    _set(part1, 4, "tdr")
+    _set(part1, 5, "tot")
+    _set(part1, 6, "beep_prompt")
+    _set(part1, 7, "voice_prompt")
+    _set(part1, 8, "language")
+    _set(part1, 9, "dtmf_mode")
+    _set(part1, 10, "scan_mode")
+    _set(part1, 11, "ptt_id")
+    _set(part1, 12, "send_id_delay")
+    _set(part1, 13, "display_mode_a")
+    _set(part1, 14, "display_mode_b")
+    _set(part1, 15, "display_mode_c")
+    _set(part1, 16, "auto_key_lock")
+    _set(part1, 17, "alarm_mode")
+    _set(part1, 18, "alarm_sound")
+    _set(part1, 20, "tail_noise_clear")
+    _set(part1, 21, "pass_repeater_noise_clear")
+    _set(part1, 22, "pass_repeater_noise_detect")
+    _set(part1, 23, "sound_tx_end")
+    _set(part1, 24, "current_work_mode")
+    _set(part1, 25, "fm_radio")
+    a = values.get("work_mode_a")
+    b = values.get("work_mode_b")
+    c = values.get("work_mode_c")
+    if any(v is None for v in (a, b, c)):
+        part1[26] = 0xFF
+    else:
+        preserved = 0 if part1[26] == 0xFF else part1[26] & 0xC0
+        part1[26] = preserved | ((int(c) & 0x03) << 4) | ((int(b) & 0x03) << 2) | (int(a) & 0x03)
+    _set(part1, 27, "lock_keyboard")
+    _set(part1, 28, "power_on_message")
+    _set(part1, 29, "bt_write_switch")
+    _set(part1, 30, "rtone")
+
+    _set(part2, 0, "vox_delay")
+    _set(part2, 1, "timer_menu_quit")
+    _set(part2, 5, "weather_channel")
+    _set(part2, 6, "divide_channel")
+    _set(part2, 7, "subaudio_scan_save")
+    _set(part2, 8, "vox_switch")
+    _set(part2, 9, "key_side1_short")
+    _set(part2, 10, "key_side1_long")
+    _set(part2, 11, "key_side2_short")
+    _set(part2, 12, "key_side2_long")
+    _set(part2, 13, "current_work_area_a")
+    _set(part2, 14, "current_work_area_b")
+    _set(part2, 15, "current_work_area_c")
+    _set(part2, 25, "ab_uv_transfer")
+    _set(part2, 26, "sound_transfer")
+    _set(part2, 27, "key0_long", mask=0x1F)
+    _set(part2, 28, "key1_long", mask=0x1F)
+    _set(part2, 29, "key2_long", mask=0x1F)
+    _set(part2, 30, "key3_long", mask=0x1F)
+    _set(part2, 31, "key4_long", mask=0x1F)
+
+    _set(part3, 0, "key5_long", mask=0x1F)
+    _set(part3, 1, "key6_long", mask=0x1F)
+    _set(part3, 2, "key7_long", mask=0x1F)
+    _set(part3, 3, "key8_long", mask=0x1F)
+    _set(part3, 4, "key9_long", mask=0x1F)
+
+    return bytes(buffer)
+
+def encode_dtmf_section(settings: Optional[DTMFSettings], raw: Optional[bytes]) -> bytes:
+    """Encode DTMF identifiers and code groups into the 384-byte block."""
+
+    if raw and len(raw) == 384:
+        buffer = bytearray(raw)
+    else:
+        buffer = bytearray(b"\xFF" * 384)
+    if settings is None:
+        return bytes(buffer)
+    info = memoryview(buffer)[0:32]
+    groups = memoryview(buffer)[32:384]
+
+    current_raw_id = _decode_dtmf_sequence(bytes(info[0:5]))
+    if settings.current_id != current_raw_id:
+        info[0:5] = _encode_dtmf_sequence(settings.current_id, 5)
+
+    def _write_mode(index: int, value: Optional[int]) -> None:
+        if value is None:
+            info[index] = 0xFF
+        else:
+            current = info[index]
+            base = 0 if current == 0xFF else current & 0xF0
+            info[index] = base | (int(value) & 0x0F)
+
+    _write_mode(6, settings.ptt_id_mode)
+    _write_mode(7, settings.last_time_send)
+    _write_mode(8, settings.last_time_stop)
+
+    for idx in range(22):
+        start = idx * 16
+        seq = settings.code_groups[idx] if idx < len(settings.code_groups) else ""
+        encoded = _encode_dtmf_sequence(seq, 6)
+        chunk = bytearray(groups[start : start + 16])
+        raw_sequence = _decode_dtmf_sequence(bytes(chunk[:16]), max_len=6)
+        if seq == raw_sequence:
+            continue
+        chunk[0:6] = encoded
+        chunk[6:16] = b"\xFF" * 10
+        groups[start : start + 16] = chunk
+
+    return bytes(buffer)
+
+def encode_modulation_sections(
+    settings: Optional[ModulationSettings],
+    params_raw: Optional[bytes],
+    names_raw: Optional[bytes],
+) -> tuple[bytes, bytes]:
+    """Serialise modulation parameter and name blocks."""
+
+    params = bytearray(params_raw) if params_raw and len(params_raw) == 256 else bytearray(b"\xFF" * 256)
+    names = bytearray(names_raw) if names_raw and len(names_raw) == 768 else bytearray(b"\xFF" * 768)
+    if settings is None:
+        return bytes(params), bytes(names)
+
+    channels = settings.channels[:16]
+
+    def _encode_freq(value: Optional[int]) -> bytes:
+        if value is None or value <= 0:
+            return b'\x00\x00'
+        scaled = max(0, min(0xFFFF, int(round(value / 10_000))))
+        return _encode_le_uint16(scaled)
+
+    for idx, channel in enumerate(channels):
+        start = idx * 2
+        fm_bytes = _encode_freq(channel.fm_frequency)
+        if params[start : start + 2] != fm_bytes:
+            params[start : start + 2] = fm_bytes
+
+        am_start = 34 + idx * 2
+        am_bytes = _encode_freq(channel.am_frequency)
+        if params[am_start : am_start + 2] != am_bytes:
+            params[am_start : am_start + 2] = am_bytes
+
+        base = 69 + idx * 5
+        ssb_bytes = _encode_freq(channel.ssb_frequency)
+        if params[base : base + 2] != ssb_bytes:
+            params[base : base + 2] = ssb_bytes
+        bandwidth = 0 if channel.ssb_bandwidth is None else channel.ssb_bandwidth & 0xFF
+        if params[base + 2] != bandwidth:
+            params[base + 2] = bandwidth
+        beat_value = 0 if channel.ssb_beat_offset is None else max(-32768, min(32767, int(channel.ssb_beat_offset)))
+        beat_bytes = _encode_le_int16(beat_value)
+        if params[base + 3 : base + 5] != beat_bytes:
+            params[base + 3 : base + 5] = beat_bytes
+
+        fm_name_offset = idx * 16
+        fm_existing = _decode_gb2312(names, fm_name_offset, max_len=16)
+        if fm_existing.rstrip('\x00') != channel.fm_name.rstrip('\x00'):
+            names[fm_name_offset : fm_name_offset + 16] = _encode_gb2312(channel.fm_name, 16)
+
+        am_name_offset = 256 + idx * 16
+        am_existing = _decode_gb2312(names, am_name_offset, max_len=16)
+        if am_existing.rstrip('\x00') != channel.am_name.rstrip('\x00'):
+            names[am_name_offset : am_name_offset + 16] = _encode_gb2312(channel.am_name, 16)
+
+        ssb_name_offset = 512 + idx * 16
+        ssb_existing = _decode_gb2312(names, ssb_name_offset, max_len=16)
+        if ssb_existing.rstrip('\x00') != channel.ssb_name.rstrip('\x00'):
+            names[ssb_name_offset : ssb_name_offset + 16] = _encode_gb2312(channel.ssb_name, 16)
+
+    for idx in range(len(channels), 16):
+        params[idx * 2 : idx * 2 + 2] = b"\xFF\xFF"
+        params[34 + idx * 2 : 34 + idx * 2 + 2] = b"\xFF\xFF"
+        base = 69 + idx * 5
+        params[base : base + 5] = b"\xFF" * 5
+        names[idx * 16 : idx * 16 + 16] = b"\xFF" * 16
+        names[256 + idx * 16 : 256 + idx * 16 + 16] = b"\xFF" * 16
+        names[512 + idx * 16 : 512 + idx * 16 + 16] = b"\xFF" * 16
+
+    def _write_param(index: int, value: Optional[int]) -> None:
+        if value is None:
+            return
+        encoded_value = value & 0xFF
+        if params[index] == 0xFF and encoded_value == 0:
+            return
+        params[index] = encoded_value
+
+    _write_param(32, settings.fm_current_channel)
+    _write_param(33, settings.work_mode)
+    _write_param(66, settings.am_current_channel)
+    _write_param(67, settings.modulation_mode)
+    _write_param(68, settings.am_rx_gain)
+    _write_param(149, settings.ssb_current_channel)
+    _write_param(150, settings.ssb_step_index)
+    _write_param(151, settings.am_step_index)
+    _write_param(152, settings.ssb_rx_gain)
+
+    return bytes(params), bytes(names)
+
+def encode_aprs_section(settings: Optional[APRSSettings], raw: Optional[bytes]) -> bytes:
+    """Encode APRS configuration into the 128-byte section."""
+
+    if raw and len(raw) == 128:
+        data = bytearray(raw)
+    else:
+        data = bytearray(b"\xFF" * 128)
+    if settings is None:
+        return bytes(data)
+
+    fields = settings.fields
+
+    def _set(idx: int, key: str, mask: int = 0x0F) -> None:
+        value = fields.get(key)
+        current = data[idx]
+        if value is None:
+            if current != 0xFF:
+                data[idx] = 0xFF
+            return
+        encoded = int(value) & mask
+        base = 0 if current == 0xFF else current & ~mask
+        new_value = base | encoded
+        if new_value != current:
+            data[idx] = new_value
+
+    _set(0, "aprs_switch")
+    _set(1, "gps_switch")
+    _set(2, "latlon_unit")
+    _set(3, "speed_unit")
+    _set(4, "distance_unit")
+    _set(5, "altitude_unit")
+    _set(6, "time_zone", mask=0x1F)
+
+    north = fields.get("north_south")
+    if north is None:
+        data[7] = 0xFF
+    else:
+        data[7] = 0x4E if int(north) == 0 else 0x53
+
+    data[8] = _encode_optional_bounded(fields.get("latitude_minute"), 59)
+    data[9] = _encode_optional_bounded(fields.get("latitude_degree"), 90)
+    data[10] = _encode_optional_bounded(fields.get("latitude_second"), 59)
+
+    east = fields.get("east_west")
+    if east is None:
+        data[11] = 0xFF
+    else:
+        data[11] = 0x57 if int(east) == 0 else 0x45
+
+    data[12] = _encode_optional_bounded(fields.get("longitude_minute"), 59)
+    data[13] = _encode_optional_bounded(fields.get("longitude_degree"), 180)
+    data[14] = _encode_optional_bounded(fields.get("longitude_second"), 59)
+
+    altitude = fields.get("altitude")
+    if altitude is None:
+        data[15:17] = b"\xFF\xFF"
+    else:
+        alt = max(-10000, min(10000, int(altitude)))
+        data[15:17] = alt.to_bytes(2, "little", signed=True)
+
+    call_sign_value = fields.get("call_sign")
+    raw_call_sign_bytes = data[17:23]
+    raw_call_sign = _decode_ascii(data, 17, 6)
+    if call_sign_value is None:
+        if any(b != 0xFF for b in raw_call_sign_bytes):
+            data[17:23] = _encode_ascii(None, 6)
+    elif call_sign_value != raw_call_sign:
+        data[17:23] = _encode_ascii(call_sign_value, 6)
+    _set(23, "ssid")
+    _set(24, "routing_select")
+    _set(25, "my_position")
+    _set(26, "radio_symbol")
+    icon = fields.get("user_defined_icon")
+    if icon is None:
+        data[27] = 0xFF
+    else:
+        data[27] = int(icon) & 0x7F
+    _set(29, "aprs_priority")
+    _set(30, "data_tx_delay")
+    _set(32, "aprs_decode_prompt_tone")
+    _set(33, "aprs_rx_auto_popup")
+    _set(34, "beacon_tx_type")
+    _set(36, "timed_beacon_time")
+    _set(38, "mice_type")
+    _set(39, "tnc_data_type")
+    _set(40, "aprs_forward_channel")
+    _set(41, "aprs_forward_routing")
+    _set(42, "aprs_wait_forward")
+    custom_one = fields.get("custom_routing_one")
+    raw_custom_one_bytes = data[43:49]
+    raw_custom_one = _decode_ascii(data, 43, 6)
+    if custom_one is None:
+        if any(b != 0xFF for b in raw_custom_one_bytes):
+            data[43:49] = _encode_ascii(None, 6)
+    elif custom_one != raw_custom_one:
+        data[43:49] = _encode_ascii(custom_one, 6)
+    _set(49, "custom_routing_one_ssid")
+    custom_two = fields.get("custom_routing_two")
+    raw_custom_two_bytes = data[50:56]
+    raw_custom_two = _decode_ascii(data, 50, 6)
+    if custom_two is None:
+        if any(b != 0xFF for b in raw_custom_two_bytes):
+            data[50:56] = _encode_ascii(None, 6)
+    elif custom_two != raw_custom_two:
+        data[50:56] = _encode_ascii(custom_two, 6)
+    _set(56, "custom_routing_two_ssid")
+    _set(78, "send_custom_messages")
+    custom_messages = fields.get("custom_messages")
+    raw_custom_messages_bytes = data[79:119]
+    raw_custom_messages = _decode_gb2312(data, 79, max_len=40)
+    if custom_messages is None:
+        if any(b != 0xFF for b in raw_custom_messages_bytes):
+            data[79:119] = b"\xFF" * 40
+    elif custom_messages != raw_custom_messages:
+        data[79:119] = _encode_gb2312(custom_messages, 40)
+
+    return bytes(data)
+
+# ---------------------------------------------------------------------------
+# Decode helpers
+# ---------------------------------------------------------------------------
+
+def _decode_vfo_frequency(digits: bytes) -> Optional[int]:
+    if all(b in (0x00, 0xFF) for b in digits):
+        return None
+    value = int("".join(str(b) for b in digits))
+    mhz = value / 100000.0
+    return int(round(mhz * 1_000_000))
+
+def _decode_offset_frequency(digits: bytes) -> Optional[int]:
+    if all(b in (0x00, 0xFF) for b in digits):
+        return None
+    value = int("".join(str(b) for b in digits))
+    mhz = value / 10000.0
+    return int(round(mhz * 1_000_000))
+
+def _decode_dtmf_sequence(data: bytes, *, max_len: int = 5) -> str:
+    sequence = []
+    for byte in data[:max_len]:
+        if byte == 0xFF:
+            break
+        if 0 <= byte < len(_DTMF_DIGITS):
+            sequence.append(_DTMF_DIGITS[byte])
+    return "".join(sequence)
+
+def _decode_le_uint16(buffer: bytes, offset: int) -> int:
+    return int.from_bytes(buffer[offset : offset + 2], "little")
+
+def _decode_le_int16(buffer: bytes, offset: int) -> int:
+    return int.from_bytes(buffer[offset : offset + 2], "little", signed=True)
+
+def _decode_gb2312(buffer: bytes, offset: int, max_len: int = 12) -> str:
+    data = bytearray()
+    consumed = 0
+    buf_len = len(buffer)
+    while consumed < max_len and (offset + consumed) < buf_len:
+        byte = buffer[offset + consumed]
+        if byte == 0xFF:
+            break
+        if (
+            byte >= 0xA1
+            and consumed + 1 < max_len
+            and (offset + consumed + 1) < buf_len
+        ):
+            data.extend(buffer[offset + consumed : offset + consumed + 2])
+            consumed += 2
+        else:
+            data.append(byte)
+            consumed += 1
+    if not data:
+        return ""
+    return bytes(data).decode("gb2312", errors="replace").strip()
+
+def _decode_ascii(buffer: bytes, offset: int, max_len: int) -> str:
+    length = 0
+    buf_len = len(buffer)
+    for idx in range(max_len):
+        if (offset + idx) >= buf_len:
+            break
+        if buffer[offset + idx] in (0xFF, 0x00):
+            break
+        length += 1
+    if length == 0:
+        return ""
+    return buffer[offset : offset + length].decode("ascii", errors="ignore").strip()
+
+# ---------------------------------------------------------------------------
+# Encode helper utilities
+# ---------------------------------------------------------------------------
+
+def _encode_vfo_frequency(hz: Optional[int]) -> bytes:
+    if hz is None:
+        return b"\xFF" * 8
+    mhz = hz / 1_000_000.0
+    digits = f"{mhz:0.5f}".replace(".", "")
+    digits = digits[:8].rjust(8, "0")
+    return bytes(int(ch) for ch in digits)
+
+def _encode_offset_frequency(hz: Optional[int]) -> bytes:
+    if hz is None:
+        return b"\xFF" * 7
+    value = int(round((hz / 1_000_000.0) * 10000))
+    digits = f"{value:07d}"
+    return bytes(int(ch) for ch in digits)
+
+def _encode_dtmf_sequence(seq: str, max_len: int) -> bytes:
+    out = bytearray(b"\xFF" * max_len)
+    if not seq:
+        return bytes(out)
+    for idx, char in enumerate(seq[:max_len]):
+        pos = _DTMF_DIGITS.find(char)
+        if pos == -1:
+            pos = _DTMF_DIGITS.find(char.upper())
+        if pos == -1:
+            continue
+        out[idx] = pos
+    return bytes(out)
+
+def _encode_le_uint16(value: int) -> bytes:
+    return int(max(0, value)).to_bytes(2, "little", signed=False)
+
+def _encode_le_int16(value: int) -> bytes:
+    return int(value).to_bytes(2, "little", signed=True)
+
+def _encode_gb2312(text: Optional[str], max_len: int) -> bytes:
+    if not text:
+        return b"\xFF" * max_len
+    encoded = text.encode("gb2312", errors="ignore")[:max_len]
+    return encoded + b"\xFF" * (max_len - len(encoded))
+
+def _encode_ascii(text: Optional[str], length: int) -> bytes:
+    if not text:
+        return b"\xFF" * length
+    encoded = text.encode("ascii", errors="ignore")[:length]
+    return encoded + b"\xFF" * (length - len(encoded))
+
+def _encode_optional_bounded(value: Optional[object], maximum: int) -> int:
+    if value is None:
+        return 0xFF
+    return min(maximum, int(value)) & 0xFF
+
+# MIT License
+#
+# Copyright (c) 2026 Nivin Goonesekera - VK3NWG
+# Portions Copyright (c) 2025 Nathan G. Barguss - 2E0NBS
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+
+"""High-level settings API for RT-950 Pro."""
+
+__all__ = [
+    "SettingsError",
+    "get_function_value",
+    "set_function_value",
+    "function_keys",
+    "get_aprs_value",
+    "set_aprs_value",
+    "aprs_keys",
+    "get_dtmf_current_id",
+    "set_dtmf_current_id",
+    "get_dtmf_code_group",
+    "set_dtmf_code_group",
+    "get_dtmf_ptt_mode",
+    "set_dtmf_ptt_mode",
+]
+
+class SettingsError(ValueError):
+    """Raised when callers attempt to set an invalid value."""
+
+@dataclass(frozen=True)
+class SettingSpec:
+    kind: str  # "bool", "int", "enum", "string"
+    min_value: Optional[int] = None
+    max_value: Optional[int] = None
+    choices: Optional[Iterable[int]] = None
+    max_length: Optional[int] = None
+
+# ---------------------------------------------------------------------------
+# Function block helpers ----------------------------------------------------
+# ---------------------------------------------------------------------------
+
+_FUNCTION_SPECS: Dict[str, SettingSpec] = {
+    "sql": SettingSpec("int", 0, 9),
+    "save_mode": SettingSpec("int", 0, 3),
+    "vox": SettingSpec("int", 0, 9),
+    "auto_backlight": SettingSpec("int", 0, 9),
+    "tdr": SettingSpec("bool"),
+    "tot": SettingSpec("int", 0, 9),
+    "beep_prompt": SettingSpec("bool"),
+    "voice_prompt": SettingSpec("enum", choices=tuple(range(0, 3))),
+    "language": SettingSpec("enum", choices=tuple(range(0, 3))),
+    "dtmf_mode": SettingSpec("enum", choices=tuple(range(0, 4))),
+    "scan_mode": SettingSpec("enum", choices=tuple(range(0, 3))),
+    "ptt_id": SettingSpec("enum", choices=tuple(range(0, 4))),
+    "send_id_delay": SettingSpec("int", 0, 9),
+    "display_mode_a": SettingSpec("enum", choices=(0, 1, 2)),
+    "display_mode_b": SettingSpec("enum", choices=(0, 1, 2)),
+    "display_mode_c": SettingSpec("enum", choices=(0, 1, 2)),
+    "auto_key_lock": SettingSpec("bool"),
+    "alarm_mode": SettingSpec("enum", choices=tuple(range(0, 3))),
+    "alarm_sound": SettingSpec("enum", choices=tuple(range(0, 3))),
+    "tail_noise_clear": SettingSpec("bool"),
+    "pass_repeater_noise_clear": SettingSpec("bool"),
+    "pass_repeater_noise_detect": SettingSpec("bool"),
+    "sound_tx_end": SettingSpec("bool"),
+    "current_work_mode": SettingSpec("enum", choices=(0, 1, 2)),
+    "fm_radio": SettingSpec("bool"),
+    "work_mode_a": SettingSpec("enum", choices=(0, 1, 2, 3)),
+    "work_mode_b": SettingSpec("enum", choices=(0, 1, 2, 3)),
+    "work_mode_c": SettingSpec("enum", choices=(0, 1, 2, 3)),
+    "lock_keyboard": SettingSpec("bool"),
+    "power_on_message": SettingSpec("enum", choices=tuple(range(0, 3))),
+    "bt_write_switch": SettingSpec("bool"),
+    "rtone": SettingSpec("enum", choices=tuple(range(0, 3))),
+    "vox_delay": SettingSpec("int", 0, 9),
+    "timer_menu_quit": SettingSpec("int", 0, 9),
+    "weather_channel": SettingSpec("enum", choices=tuple(range(0, 10))),
+    "divide_channel": SettingSpec("bool"),
+    "subaudio_scan_save": SettingSpec("bool"),
+    "vox_switch": SettingSpec("bool"),
+    "key_side1_short": SettingSpec("enum", choices=tuple(range(0, 32))),
+    "key_side1_long": SettingSpec("enum", choices=tuple(range(0, 32))),
+    "key_side2_short": SettingSpec("enum", choices=tuple(range(0, 32))),
+    "key_side2_long": SettingSpec("enum", choices=tuple(range(0, 32))),
+    "current_work_area_a": SettingSpec("enum", choices=tuple(range(0, 16))),
+    "current_work_area_b": SettingSpec("enum", choices=tuple(range(0, 16))),
+    "current_work_area_c": SettingSpec("enum", choices=tuple(range(0, 16))),
+    "ab_uv_transfer": SettingSpec("bool"),
+    "sound_transfer": SettingSpec("bool"),
+    "key0_long": SettingSpec("enum", choices=tuple(range(0, 32))),
+    "key1_long": SettingSpec("enum", choices=tuple(range(0, 32))),
+    "key2_long": SettingSpec("enum", choices=tuple(range(0, 32))),
+    "key3_long": SettingSpec("enum", choices=tuple(range(0, 32))),
+    "key4_long": SettingSpec("enum", choices=tuple(range(0, 32))),
+    "key5_long": SettingSpec("enum", choices=tuple(range(0, 32))),
+    "key6_long": SettingSpec("enum", choices=tuple(range(0, 32))),
+    "key7_long": SettingSpec("enum", choices=tuple(range(0, 32))),
+    "key8_long": SettingSpec("enum", choices=tuple(range(0, 32))),
+    "key9_long": SettingSpec("enum", choices=tuple(range(0, 32))),
+}
+
+def function_keys() -> Iterable[str]:
+    """Return all supported function-setting keys."""
+
+    return _FUNCTION_SPECS.keys()
+
+def _coerce_bool(value) -> int:
+    if isinstance(value, bool):
+        return 1 if value else 0
+    if value in (0, 1):
+        return int(value)
+    raise SettingsError("Boolean setting expects True/False or 0/1")
+
+def _validate(spec: SettingSpec, value) -> int:
+    if spec.kind == "bool":
+        return _coerce_bool(value)
+    if not isinstance(value, int):
+        raise SettingsError("Setting expects integer value")
+    if spec.kind == "int":
+        if spec.min_value is not None and value < spec.min_value:
+            raise SettingsError(f"Value {value} below minimum {spec.min_value}")
+        if spec.max_value is not None and value > spec.max_value:
+            raise SettingsError(f"Value {value} above maximum {spec.max_value}")
+        return value
+    if spec.kind == "enum":
+        if spec.choices is not None and value not in spec.choices:
+            raise SettingsError(f"Value {value} not in allowed choices {tuple(spec.choices)}")
+        return value
+    raise SettingsError(f"Unsupported setting kind {spec.kind}")
+
+def get_function_value(settings: FunctionSettings, key: str):
+    """Return a user-friendly value for ``key`` (or ``None`` if unset)."""
+
+    if key not in _FUNCTION_SPECS:
+        raise KeyError(key)
+    value = settings.values.get(key)
+    if value is None:
+        return None
+    spec = _FUNCTION_SPECS[key]
+    if spec.kind == "bool":
+        return bool(value)
+    return value
+
+def set_function_value(settings: FunctionSettings, key: str, value) -> None:
+    """Update ``key`` within ``settings`` after validating the input."""
+
+    if key not in _FUNCTION_SPECS:
+        raise KeyError(key)
+    if value is None:
+        settings.values[key] = None
+        return
+    spec = _FUNCTION_SPECS[key]
+    encoded = _validate(spec, value)
+    settings.values[key] = encoded
+
+# ---------------------------------------------------------------------------
+# APRS helpers --------------------------------------------------------------
+# ---------------------------------------------------------------------------
+
+_APRS_SPECS: Dict[str, SettingSpec] = {
+    "aprs_switch": SettingSpec("bool"),
+    "gps_switch": SettingSpec("bool"),
+    "latlon_unit": SettingSpec("enum", choices=(0, 1)),
+    "speed_unit": SettingSpec("enum", choices=(0, 1)),
+    "distance_unit": SettingSpec("enum", choices=(0, 1)),
+    "altitude_unit": SettingSpec("enum", choices=(0, 1)),
+    "time_zone": SettingSpec("int", 0, 23),
+    "north_south": SettingSpec("enum", choices=(0, 1)),
+    "latitude_minute": SettingSpec("int", 0, 59),
+    "latitude_degree": SettingSpec("int", 0, 90),
+    "latitude_second": SettingSpec("int", 0, 59),
+    "east_west": SettingSpec("enum", choices=(0, 1)),
+    "longitude_minute": SettingSpec("int", 0, 59),
+    "longitude_degree": SettingSpec("int", 0, 180),
+    "longitude_second": SettingSpec("int", 0, 59),
+    "altitude": SettingSpec("int", -10000, 10000),
+    "call_sign": SettingSpec("string", max_length=6),
+    "ssid": SettingSpec("enum", choices=tuple(range(0, 16))),
+    "routing_select": SettingSpec("enum", choices=tuple(range(0, 6))),
+    "my_position": SettingSpec("enum", choices=tuple(range(0, 6))),
+    "radio_symbol": SettingSpec("enum", choices=tuple(range(0, 100))),
+    "user_defined_icon": SettingSpec("enum", choices=tuple(range(0, 128))),
+    "aprs_priority": SettingSpec("enum", choices=tuple(range(0, 3))),
+    "data_tx_delay": SettingSpec("int", 0, 9),
+    "aprs_decode_prompt_tone": SettingSpec("bool"),
+    "aprs_rx_auto_popup": SettingSpec("bool"),
+    "beacon_tx_type": SettingSpec("enum", choices=tuple(range(0, 3))),
+    "timed_beacon_time": SettingSpec("int", 0, 60),
+    "mice_type": SettingSpec("enum", choices=tuple(range(0, 4))),
+    "tnc_data_type": SettingSpec("enum", choices=tuple(range(0, 4))),
+    "aprs_forward_channel": SettingSpec("enum", choices=tuple(range(0, 16))),
+    "aprs_forward_routing": SettingSpec("enum", choices=tuple(range(0, 6))),
+    "aprs_wait_forward": SettingSpec("int", 0, 9),
+    "custom_routing_one": SettingSpec("string", max_length=6),
+    "custom_routing_one_ssid": SettingSpec("enum", choices=tuple(range(0, 16))),
+    "custom_routing_two": SettingSpec("string", max_length=6),
+    "custom_routing_two_ssid": SettingSpec("enum", choices=tuple(range(0, 16))),
+    "send_custom_messages": SettingSpec("bool"),
+    "custom_messages": SettingSpec("string", max_length=40),
+}
+
+def aprs_keys() -> Iterable[str]:
+    return _APRS_SPECS.keys()
+
+def get_aprs_value(settings: APRSSettings, key: str):
+    if key not in _APRS_SPECS:
+        raise KeyError(key)
+    value = settings.fields.get(key)
+    spec = _APRS_SPECS[key]
+    if value is None:
+        return None
+    if spec.kind == "bool":
+        return bool(value)
+    return value
+
+def set_aprs_value(settings: APRSSettings, key: str, value) -> None:
+    if key not in _APRS_SPECS:
+        raise KeyError(key)
+    if value is None:
+        settings.fields[key] = None
+        return
+    spec = _APRS_SPECS[key]
+    if spec.kind == "string":
+        if not isinstance(value, str):
+            raise SettingsError("String setting expects str value")
+        if spec.max_length is not None and len(value) > spec.max_length:
+            raise SettingsError(
+                f"String '{value}' longer than allowed {spec.max_length} characters"
+            )
+        settings.fields[key] = value
+        return
+    encoded = _validate(spec, value)
+    settings.fields[key] = encoded
+
+# ---------------------------------------------------------------------------
+# DTMF helpers --------------------------------------------------------------
+# ---------------------------------------------------------------------------
+
+_ALLOWED_DTMF = set("0123456789ABCD*#")
+
+def _validate_dtmf_string(value: str, max_len: int) -> str:
+    if not isinstance(value, str):
+        raise SettingsError("DTMF sequence must be a string")
+    filtered = value.strip()
+    if len(filtered) > max_len:
+        raise SettingsError(f"DTMF value '{value}' exceeds {max_len} characters")
+    if not all(ch in _ALLOWED_DTMF for ch in filtered):
+        raise SettingsError("DTMF value contains invalid characters")
+    return filtered
+
+def get_dtmf_current_id(settings: DTMFSettings) -> str:
+    return settings.current_id
+
+def set_dtmf_current_id(settings: DTMFSettings, value: str) -> None:
+    settings.current_id = _validate_dtmf_string(value, 5)
+
+def get_dtmf_ptt_mode(settings: DTMFSettings) -> Optional[int]:
+    return settings.ptt_id_mode
+
+def set_dtmf_ptt_mode(settings: DTMFSettings, value: Optional[int]) -> None:
+    if value is None:
+        settings.ptt_id_mode = None
+        return
+    if value not in (0, 1, 2, 3):
+        raise SettingsError("DTMF PTT mode must be 0-3")
+    settings.ptt_id_mode = value
+
+def get_dtmf_code_group(settings: DTMFSettings, index: int) -> str:
+    return settings.code_groups[index]
+
+def set_dtmf_code_group(settings: DTMFSettings, index: int, value: str) -> None:
+    if not 0 <= index < len(settings.code_groups):
+        raise IndexError(index)
+    settings.code_groups[index] = _validate_dtmf_string(value, 6)
+
+# MIT License
+#
+# Copyright (c) 2026 Nivin Goonesekera - VK3NWG
+# Portions Copyright (c) 2025 Nathan G. Barguss - 2E0NBS
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+
+"""Representation of RT-950 Pro radio images."""
+__all__ = [
+    "CHANNEL_COUNT",
+    "CHANNEL_SIZE",
+    "CHANNEL_SECTION_BYTES",
+    "RadioImage",
+]
+
+CHANNEL_LOG = logging.getLogger(__name__ + ".image")
+
+CHANNEL_COUNT = 960
+"""Total number of memory channels supported by the radio."""
+
+CHANNEL_SIZE = 32
+"""Size in bytes of a single channel record."""
+
+CHANNEL_SECTION_BYTES = CHANNEL_COUNT * CHANNEL_SIZE
+"""Total byte length of the channel section within the clone image."""
+
+VFO_DATA_BYTES = 96
+VFO_SEGMENT_BYTES = 0x100
+FUNCTION_DATA_BYTES = 96
+FUNCTION_SEGMENT_BYTES = 0x100
+DTMF_DATA_BYTES = 384
+DTMF_SEGMENT_BYTES = 0x200
+MODULATION_PARAM_DATA_BYTES = 256
+MODULATION_PARAM_SEGMENT_BYTES = 0x200
+MODULATION_NAME_SEGMENT_BYTES = 0x300
+APRS_SEGMENT_BYTES = 0x80
+
+KNOWN_SEGMENT_BYTES = (
+    VFO_SEGMENT_BYTES
+    + FUNCTION_SEGMENT_BYTES
+    + DTMF_SEGMENT_BYTES
+    + MODULATION_PARAM_SEGMENT_BYTES
+    + MODULATION_NAME_SEGMENT_BYTES
+    + APRS_SEGMENT_BYTES
+)
+
+def _chunk(iterable: Sequence[int], size: int) -> Iterable[bytes]:
+    """Yield fixed-size chunks from `iterable` using the provided `size`."""
+
+    for i in range(0, len(iterable), size):
+        chunk = iterable[i : i + size]
+        if len(chunk) == size:
+            yield bytes(chunk)
+
+@dataclass
+class RadioImage:
+    """Container for clone image sections."""
+
+    channels: List[ChannelRecord]
+    vfo: Optional[List[VFOSettings]] = None
+    function: Optional[FunctionSettings] = None
+    dtmf: Optional[DTMFSettings] = None
+    modulation: Optional[ModulationSettings] = None
+    aprs: Optional[APRSSettings] = None
+    remainder: bytes = b""
+
+    @classmethod
+    def from_bytes(
+        cls,
+        blob: bytes,
+        *,
+        logger: Optional[logging.Logger] = None,
+    ) -> "RadioImage":
+        """Parse a raw clone image into structured data."""
+
+        logger = logger or CHANNEL_LOG
+        if len(blob) < CHANNEL_SECTION_BYTES:
+            raise ValueError(
+                f"Clone image is too small ({len(blob)} bytes); expected at least {CHANNEL_SECTION_BYTES}"
+            )
+
+        channel_bytes = memoryview(blob)[:CHANNEL_SECTION_BYTES]
+        channels: List[ChannelRecord] = []
+        for index, chunk in enumerate(_chunk(channel_bytes, CHANNEL_SIZE)):
+            try:
+                record = ChannelRecord.from_bytes(chunk, logger=logger)
+            except ValueError as exc:
+                raise ValueError(f"Failed to decode channel {index}: {exc}") from exc
+            channels.append(record)
+
+        offset = CHANNEL_SECTION_BYTES
+        vfo: Optional[List[VFOSettings]] = None
+        function: Optional[FunctionSettings] = None
+        dtmf: Optional[DTMFSettings] = None
+        modulation: Optional[ModulationSettings] = None
+        aprs: Optional[APRSSettings] = None
+
+        if len(blob) >= offset + VFO_SEGMENT_BYTES:
+            vfo_segment = bytes(blob[offset : offset + VFO_SEGMENT_BYTES])
+            vfo = parse_vfo_section(vfo_segment[:VFO_DATA_BYTES])
+        offset += VFO_SEGMENT_BYTES
+
+        if len(blob) >= offset + FUNCTION_SEGMENT_BYTES:
+            function_segment = bytes(blob[offset : offset + FUNCTION_SEGMENT_BYTES])
+            function = parse_function_section(function_segment[:FUNCTION_DATA_BYTES])
+        offset += FUNCTION_SEGMENT_BYTES
+
+        if len(blob) >= offset + DTMF_SEGMENT_BYTES:
+            dtmf_segment = bytes(blob[offset : offset + DTMF_SEGMENT_BYTES])
+            dtmf = parse_dtmf_section(dtmf_segment[:DTMF_DATA_BYTES])
+        offset += DTMF_SEGMENT_BYTES
+
+        if len(blob) >= offset + MODULATION_PARAM_SEGMENT_BYTES + MODULATION_NAME_SEGMENT_BYTES:
+            params_segment = bytes(blob[offset : offset + MODULATION_PARAM_SEGMENT_BYTES])
+            names_segment = bytes(
+                blob[
+                    offset
+                    + MODULATION_PARAM_SEGMENT_BYTES : offset
+                    + MODULATION_PARAM_SEGMENT_BYTES
+                    + MODULATION_NAME_SEGMENT_BYTES
+                ]
+            )
+            modulation = parse_modulation_sections(
+                params_segment[:MODULATION_PARAM_DATA_BYTES],
+                names_segment[:MODULATION_NAME_SEGMENT_BYTES],
+            )
+        offset += MODULATION_PARAM_SEGMENT_BYTES + MODULATION_NAME_SEGMENT_BYTES
+
+        if len(blob) >= offset + APRS_SEGMENT_BYTES:
+            aprs_data = bytes(blob[offset : offset + APRS_SEGMENT_BYTES])
+            aprs = parse_aprs_section(aprs_data[:APRS_SEGMENT_BYTES])
+
+        remainder = bytes(blob[CHANNEL_SECTION_BYTES:])
+        return cls(
+            channels=channels,
+            vfo=vfo,
+            function=function,
+            dtmf=dtmf,
+            modulation=modulation,
+            aprs=aprs,
+            remainder=remainder,
+        )
+
+    @classmethod
+    def from_file(
+        cls,
+        path: Path,
+        *,
+        logger: Optional[logging.Logger] = None,
+    ) -> "RadioImage":
+        """Load an image from `path` then parse it via :meth:
+rom_bytes."""
+
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            raise ValueError(f"Unable to read image file {path}: {exc}") from exc
+        return cls.from_bytes(data, logger=logger)
+
+    def to_bytes(self, *, logger: Optional[logging.Logger] = None) -> bytes:
+        """Serialise the image back into clone format."""
+
+        logger = logger or CHANNEL_LOG
+        if len(self.channels) != CHANNEL_COUNT:
+            raise ValueError(
+                f"Image must contain {CHANNEL_COUNT} channels; has {len(self.channels)}"
+            )
+
+        tail = bytearray(self.remainder)
+        if len(tail) < KNOWN_SEGMENT_BYTES:
+            tail.extend(b"\xFF" * (KNOWN_SEGMENT_BYTES - len(tail)))
+
+        offset = 0
+
+        vfo_segment = bytearray(tail[offset : offset + VFO_SEGMENT_BYTES])
+        vfo_encoded = encode_vfo_section(self.vfo, bytes(vfo_segment[:VFO_DATA_BYTES]))
+        vfo_segment[:VFO_DATA_BYTES] = vfo_encoded
+        tail[offset : offset + VFO_SEGMENT_BYTES] = vfo_segment
+        offset += VFO_SEGMENT_BYTES
+
+        function_segment = bytearray(tail[offset : offset + FUNCTION_SEGMENT_BYTES])
+        function_encoded = encode_function_section(
+            self.function, bytes(function_segment[:FUNCTION_DATA_BYTES])
+        )
+        function_segment[:FUNCTION_DATA_BYTES] = function_encoded
+        tail[offset : offset + FUNCTION_SEGMENT_BYTES] = function_segment
+        offset += FUNCTION_SEGMENT_BYTES
+
+        dtmf_segment = bytearray(tail[offset : offset + DTMF_SEGMENT_BYTES])
+        dtmf_encoded = encode_dtmf_section(self.dtmf, bytes(dtmf_segment[:DTMF_DATA_BYTES]))
+        dtmf_segment[:DTMF_DATA_BYTES] = dtmf_encoded
+        tail[offset : offset + DTMF_SEGMENT_BYTES] = dtmf_segment
+        offset += DTMF_SEGMENT_BYTES
+
+        params_offset = offset
+        names_offset = params_offset + MODULATION_PARAM_SEGMENT_BYTES
+
+        params_segment = bytearray(tail[params_offset : params_offset + MODULATION_PARAM_SEGMENT_BYTES])
+        names_segment = bytearray(tail[names_offset : names_offset + MODULATION_NAME_SEGMENT_BYTES])
+        params_raw = bytes(params_segment[:MODULATION_PARAM_DATA_BYTES])
+        names_raw = bytes(names_segment[:MODULATION_NAME_SEGMENT_BYTES])
+        mod_params, mod_names = encode_modulation_sections(
+            self.modulation, params_raw, names_raw
+        )
+        params_segment[:MODULATION_PARAM_DATA_BYTES] = mod_params
+        names_segment[:MODULATION_NAME_SEGMENT_BYTES] = mod_names
+        tail[params_offset : params_offset + MODULATION_PARAM_SEGMENT_BYTES] = params_segment
+        tail[names_offset : names_offset + MODULATION_NAME_SEGMENT_BYTES] = names_segment
+        offset = names_offset + MODULATION_NAME_SEGMENT_BYTES
+
+        aprs_segment = bytearray(tail[offset : offset + APRS_SEGMENT_BYTES])
+        aprs_encoded = encode_aprs_section(self.aprs, bytes(aprs_segment))
+        tail[offset : offset + APRS_SEGMENT_BYTES] = aprs_encoded
+
+        buffer = bytearray(CHANNEL_SECTION_BYTES + len(tail))
+        for index, channel in enumerate(self.channels):
+            start = index * CHANNEL_SIZE
+            buffer[start : start + CHANNEL_SIZE] = channel.to_bytes(logger=logger)
+
+        buffer[CHANNEL_SECTION_BYTES:] = tail
+        return bytes(buffer)
+
+    def empty_slot_indexes(self) -> List[int]:
+        """Return indexes of channels that contain no receive frequency."""
+
+        return [idx for idx, channel in enumerate(self.channels) if channel.rx_hz is None]
+
+    def iter_populated_channels(self) -> Iterable[tuple[int, ChannelRecord]]:
+        """Iterate over channels that have a defined receive frequency."""
+
+        for index, channel in enumerate(self.channels):
+            if channel.rx_hz is not None:
+                yield index, channel
+
+    def save(self, path: Path, *, logger: Optional[logging.Logger] = None) -> None:
+        """Write the current image representation to `path`."""
+
+        data = self.to_bytes(logger=logger)
+        try:
+            path.write_bytes(data)
+        except OSError as exc:
+            raise ValueError(f"Unable to write image file {path}: {exc}") from exc
+
+# MIT License
+#
+# Copyright (c) 2026 Nivin Goonesekera - VK3NWG
+# Portions Copyright (c) 2025 Nathan G. Barguss - 2E0NBS
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+
+"""Serial transport for RT-950 Pro clone operations."""
+
+__all__ = [
+    "CloneTransportError",
+    "CloneSerialConfig",
+    "CloneSegment",
+    "CloneSerialTransport",
+]
+
+HANDSHAKE_STRING = b"PROGRAMBT9000U"
+ACK = b"\x06"
+END_COMMAND = b"E"
+READ_BLOCK = 0x80
+BLOCK_HEADER = 4
+
+def get_logger(name: str) -> logging.Logger:
+    return logging.getLogger(f"rt950pro.{name}")
+
+ENCRYPT_STRINGS: Tuple[bytes, ...] = (
+    b"BHT ",
+    b"CO 7",
+    b"A ES",
+    b" EIY",
+    b"M PQ",
+    b"XN Y",
+    b"RVB ",
+    b" HQP",
+    b"W RC",
+    b"MS N",
+    b" SAT",
+    b"K DH",
+    b"ZO R",
+    b"C SL",
+    b"6RB ",
+    b" JCG",
+    b"PN V",
+    b"J PK",
+    b"EK L",
+    b"I LZ",
+)
+
+@dataclass(slots=True)
+class CloneSegment:
+    """Defines a contiguous clone memory region to read or write.
+
+    The trailing fields tune *write* pacing per segment (adaptive speed):
+
+    - ``ack_timeout``  wall-clock budget for the per-block 0x06 ACK. Bulk
+      channels answer fast; a settings/APRS flash commit can stall for seconds.
+    - ``post_block_delay``  settle inserted *after* each block's ACK. Zero for
+      bulk channels (go as fast as the link allows); a small pause for the
+      sensitive settings/APRS segments so the radio's flash can keep up.
+    - ``commit``  marks the segment whose write triggers a flash commit (APRS).
+      ``write_clone`` settles ``commit_settle`` seconds after the last commit
+      block before sending the single END, so everything lands together.
+    """
+
+    read_command: int
+    write_command: int
+    start: int
+    length: int
+    ack_timeout: float = 8.0
+    post_block_delay: float = 0.0
+    commit: bool = False
+    commit_settle: float = 0.0
+
+# Adaptive write pacing: bulk channels run flat-out (no inter-block delay, short
+# ACK budget), the small settings segments get a touch of slack, and the APRS
+# segment gets a long ACK budget + a post-write settle because it commits to
+# flash. The big speed win comes from the bridge writing bulk blocks
+# write-without-response; these knobs keep the sensitive tail reliable.
+DEFAULT_SEGMENTS: Tuple[CloneSegment, ...] = (
+    CloneSegment(0x52, 0x57, 0x0000, 0x7800, ack_timeout=8.0),
+    CloneSegment(0x52, 0x57, 0x8000, 0x0100, ack_timeout=10.0, post_block_delay=0.05),
+    CloneSegment(0x52, 0x57, 0x9000, 0x0100, ack_timeout=10.0, post_block_delay=0.05),
+    CloneSegment(0x52, 0x57, 0xA000, 0x0200, ack_timeout=10.0, post_block_delay=0.05),
+    CloneSegment(0x52, 0x57, 0xB000, 0x0200, ack_timeout=10.0, post_block_delay=0.05),
+    CloneSegment(0x52, 0x57, 0xD000, 0x0300, ack_timeout=10.0, post_block_delay=0.05),
+    # APRS read 0x54 / write 0x58 (0x58 confirmed by aprs_probe.py: bare 0x06
+    # ACK, toggle-and-readback persisted, across multiple XOR keys; the USB
+    # driver's guessed 0x55 returns a 54 5A.. status/error frame). The radio
+    # self-commits on the ACK and then drops the BLE link, so write_clone treats
+    # the trailing END as best-effort.
+    CloneSegment(0x54, 0x58, 0x0000, 0x0080, ack_timeout=30.0,
+                 post_block_delay=0.10, commit=True, commit_settle=0.5),
+)
+
+class CloneTransportError(RuntimeError):
+    """Raised when the serial clone transport encounters a protocol error."""
+
+@dataclass(slots=True)
+class CloneSerialConfig:
+    """Configuration for opening a serial connection to the radio."""
+
+    port: str
+    baudrate: int = 115200
+    timeout: float = 1.0
+    write_timeout: float = 1.0
+
+class CloneSerialTransport:
+    """Serial transport implementing the RT-950 Pro clone protocol."""
+
+    def __init__(
+        self,
+        serial_port,
+        *,
+        logger=None,
+        rng: Optional[random.Random] = None,
+    ) -> None:
+        self.serial = serial_port
+        self.logger = logger or get_logger("transport")
+        # Short per-read timeout (0.5 s) so empty reads return promptly and the
+        # handshake's wall-clock deadline (see _read_exact max_wait) is precise.
+        # Block reads are unaffected: serial.read returns as soon as notify data
+        # arrives (~tens of ms), never waiting out this timeout on the happy path.
+        try:
+            self.serial.timeout = 0.5
+        except Exception:
+            pass
+        try:
+            self.serial.write_timeout = 2.0
+        except Exception:
+            pass
+        self._rng = rng or random.Random()
+        self._xor_key: Optional[bytearray] = None
+        self._model: Optional[str] = None
+        # Optional per-block progress callback: (done, total, phase)
+        self.progress_cb: Optional[Callable[[int, int, str], None]] = None
+
+    @classmethod
+    def open(
+        cls,
+        config: CloneSerialConfig,
+        *,
+        logger=None,
+        rng: Optional[random.Random] = None,
+        serial_class=serial.Serial,
+    ) -> "CloneSerialTransport":
+        """Open a real serial port and return a configured transport."""
+
+        port = serial_class(
+            config.port,
+            baudrate=config.baudrate,
+            timeout=config.timeout,
+            write_timeout=config.write_timeout,
+        )
+        return cls(port, logger=logger, rng=rng)
+
+    def __enter__(self) -> "CloneSerialTransport":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:  # type: ignore[override]
+        self.close()
+
+    @property
+    def model(self) -> Optional[str]:
+        """Radio model string retrieved during handshake (if available)."""
+
+        return self._model
+
+    def close(self) -> None:
+        """Close the underlying serial port."""
+
+        try:
+            self.serial.close()
+        except Exception:  # pragma: no cover - defensive cleanup
+            pass
+
+    def handshake(self) -> str:
+        """Perform the clone handshake, retrying on a cold BLE link.
+
+        The first request/notify round-trip after the bridge connects is often
+        dropped by the radio or the Windows BLE stack, so the opening byte of
+        the handshake can time out even though the link is fine. Retrying a few
+        times (clearing buffers between) makes that first-attempt miss invisible
+        instead of failing the whole clone.
+        """
+        import time as _time
+
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, 4):
+            try:
+                return self._handshake_once()
+            except CloneTransportError as exc:
+                last_exc = exc
+                self.logger.debug(
+                    "Handshake attempt %d/3 failed (%s); retrying", attempt, exc
+                )
+                for meth in ("reset_input_buffer", "reset_output_buffer"):
+                    if hasattr(self.serial, meth):
+                        try:
+                            getattr(self.serial, meth)()
+                        except Exception:
+                            pass
+                _time.sleep(0.3)
+        assert last_exc is not None
+        raise last_exc
+
+    def _handshake_once(self) -> str:
+        """Perform the clone handshake and establish the XOR keystream."""
+        import time as _time
+
+        self.logger.debug("Starting clone handshake")
+        if hasattr(self.serial, "reset_input_buffer"):
+            self.serial.reset_input_buffer()
+        if hasattr(self.serial, "reset_output_buffer"):
+            self.serial.reset_output_buffer()
+        # Brief settle so the bridge is ready before the first byte hits the
+        # wire. The bridge unlocks and goes live before CHIRP connects, so a
+        # short pause is plenty; the previous 500 ms was overly cautious.
+        _time.sleep(0.2)
+
+        # Short per-read deadline: a healthy handshake answers in well under a
+        # second, while a cold-link stall hangs for ~20s. Failing in ~2.5s lets
+        # handshake() retry almost immediately instead of making the user wait.
+        hs_wait = 2.5
+
+        self._write(HANDSHAKE_STRING)
+        if self._read_exact(1, max_wait=hs_wait) != ACK:
+            raise CloneTransportError("Handshake ACK not received")
+
+        self._write(b"F")
+        blob = self._read_exact(16, max_wait=hs_wait)
+        # On a cold BLE link the radio sometimes emits a duplicate/late 0x06
+        # ahead of the ident (seen in serial traces), shifting the 16-byte
+        # blob by one and desyncing every later read. Drop stray ACKs and
+        # pull the displaced tail bytes so the blob stays aligned.
+        strips = 0
+        while blob.startswith(ACK) and strips < 4:
+            blob = blob[1:] + self._read_exact(1, max_wait=hs_wait)
+            strips += 1
+        if strips:
+            self.logger.debug("Dropped %d stray ACK byte(s) before ident", strips)
+        self.logger.debug("Received handshake blob: %s", blob.hex())
+
+        self._write(b"M")
+        model_raw = self._read_exact(12, max_wait=hs_wait)
+        self._model = model_raw.decode("ascii", errors="ignore").strip("\x00 ")
+        if not self._model:
+            raise CloneTransportError("Radio did not return a model identifier")
+        self.logger.debug("Radio model reported as %s", self._model)
+
+        frame, key = self._build_encryption_frame()
+        self._write(frame)
+        if self._read_exact(1, max_wait=hs_wait) != ACK:
+            raise CloneTransportError("Encryption ACK not received")
+        self._xor_key = key
+        self.logger.debug("Negotiated XOR key: %s", key.hex())
+        return self._model
+
+    def read_clone(self, *, segments: Sequence[CloneSegment] | None = None) -> bytes:
+        """Read clone data according to ``segments`` and return the raw payload."""
+        import time as _time
+
+        if segments is None:
+            segments = DEFAULT_SEGMENTS
+        if self._xor_key is None:
+            self.handshake()
+
+        raw = bytearray()
+        total_blocks = sum(seg.length for seg in segments) // READ_BLOCK
+        done = 0
+        for command, address in self._iter_read_commands(segments):
+            header = bytes((command, (address >> 8) & 0xFF, address & 0xFF, READ_BLOCK))
+            self.logger.debug(
+                "Requesting block: command=0x%02X address=0x%04X", command, address
+            )
+            block = None
+            for attempt in range(3):
+                self._write(header)
+                try:
+                    block = self._read_exact(BLOCK_HEADER + READ_BLOCK)
+                    break
+                except CloneTransportError as exc:
+                    # BLE links occasionally drop a request/notify burst; retry
+                    # only when nothing was received for this block.
+                    if f"(0/{BLOCK_HEADER + READ_BLOCK} bytes received)" not in str(exc):
+                        raise
+                    self.logger.debug(
+                        "Read block timeout at 0x%04X (attempt %d/3), retrying",
+                        address,
+                        attempt + 1,
+                    )
+                    if hasattr(self.serial, "reset_input_buffer"):
+                        try:
+                            self.serial.reset_input_buffer()
+                        except Exception:
+                            pass
+                    _time.sleep(0.1)
+            if block is None:
+                raise CloneTransportError(
+                    f"Serial read timed out (0/{BLOCK_HEADER + READ_BLOCK} bytes received)"
+                )
+            payload = bytearray(block[BLOCK_HEADER:])
+            decrypted = self._apply_xor(payload)
+            raw.extend(decrypted)
+            done += 1
+            if self.progress_cb:
+                try:
+                    self.progress_cb(done, total_blocks, "read")
+                except Exception:
+                    # Progress should never break the clone operation
+                    pass
+        self._write(END_COMMAND)
+        return bytes(raw)
+
+    def write_clone(self, data: bytes, *, segments: Sequence[CloneSegment] | None = None) -> None:
+        """Write clone data back to the radio using the provided segments."""
+
+        if segments is None:
+            segments = DEFAULT_SEGMENTS
+        if self._xor_key is None:
+            self.handshake()
+
+        expected = sum(segment.length for segment in segments)
+        if len(data) != expected:
+            raise CloneTransportError(f"Write buffer length {len(data)} does not match expected {expected}")
+
+        import time as _time
+        offset = 0
+        total_blocks = sum(seg.length for seg in segments) // READ_BLOCK
+        done = 0
+        # Iterate by segment (not _iter_write_commands) so each block knows its
+        # segment's adaptive pacing: ACK budget, post-block settle, and whether
+        # it is the flash-commit (APRS) segment that needs a settle before END.
+        last_segment: Optional[CloneSegment] = None
+        for segment in segments:
+            for addr_off in range(0, segment.length, READ_BLOCK):
+                address = segment.start + addr_off
+                command = segment.write_command
+                chunk = data[offset : offset + READ_BLOCK]
+                if len(chunk) != READ_BLOCK:
+                    raise CloneTransportError("Write chunk size mismatch")
+                payload = self._apply_xor(bytearray(chunk))
+                header = bytes((command, (address >> 8) & 0xFF, address & 0xFF, READ_BLOCK))
+                self.logger.debug("Writing block: command=0x%02X address=0x%04X", command, address)
+                self._write(header + payload)
+                # On a write the radio stays silent until it has the whole
+                # block, then sends a single 0x06 ACK.  _read_exact blocks only
+                # until that byte actually arrives (no fixed delay).  Accept
+                # 0x06 anywhere in the first few bytes in case the radio echoes
+                # the header before the ACK.  The ACK budget is per-segment:
+                # bulk channels answer fast, while a settings/APRS flash commit
+                # can stall for seconds.  The happy path is unaffected because
+                # the read returns as soon as the byte arrives.
+                ack_buf = self._read_exact(1, max_wait=segment.ack_timeout)
+                for _ in range(3):
+                    if ACK in ack_buf:
+                        break
+                    extra = self.serial.read(1)
+                    if extra:
+                        ack_buf += extra
+                if ACK not in ack_buf:
+                    # Diagnostic: drain the radio's COMPLETE reply (up to a full
+                    # ~132-byte frame) so the log shows everything it sent for
+                    # this block, not just the first few bytes.
+                    drain_deadline = _time.monotonic() + 2.5
+                    while len(ack_buf) < 140 and _time.monotonic() < drain_deadline:
+                        extra = self.serial.read(140 - len(ack_buf))
+                        if extra:
+                            ack_buf += extra
+                            drain_deadline = _time.monotonic() + 0.4  # extend while flowing
+                        else:
+                            _time.sleep(0.02)
+                    self.logger.debug(
+                        "Block 0x%02X@0x%04X reply (%d bytes): %s",
+                        command, address, len(ack_buf), ack_buf.hex()
+                    )
+                    raise CloneTransportError(
+                        f"Write ACK mismatch at 0x{address:04X}: expected 0x06, "
+                        f"got {ack_buf.hex() or '(nothing)'}"
+                    )
+                self.logger.debug("Received ACK for 0x%04X", address)
+                offset += READ_BLOCK
+                done += 1
+                if self.progress_cb:
+                    try:
+                        self.progress_cb(done, total_blocks, "write")
+                    except Exception:
+                        pass
+                if segment.post_block_delay:
+                    _time.sleep(segment.post_block_delay)
+            last_segment = segment
+
+        # Settle after the flash-commit (APRS) segment so the radio finishes
+        # committing before the single END tells it the clone is done.
+        if last_segment is not None and last_segment.commit and last_segment.commit_settle:
+            _time.sleep(last_segment.commit_settle)
+        # END is best-effort: every block (including APRS) already commits on its
+        # own 0x06 ACK, and the radio drops the BLE link the instant it commits
+        # the APRS segment — so the END may never reach it. A failed/lost END
+        # must not turn a fully-committed upload into a CHIRP error.
+        try:
+            self._write(END_COMMAND)
+        except Exception as exc:
+            self.logger.debug("END not delivered (link likely dropped post-commit): %s", exc)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _write(self, data: bytes) -> None:
+        if not data:
+            return
+        written = self.serial.write(data)
+        if hasattr(self.serial, "flush"):
+            try:
+                self.serial.flush()
+            except Exception:
+                pass
+        if written is None:
+            return
+        if written != len(data):
+            raise CloneTransportError("Serial write truncated")
+
+    def _read_exact(self, size: int, max_wait: Optional[float] = None) -> bytes:
+        import time as _time
+        buf = bytearray()
+        empty_reads = 0
+        start = _time.monotonic()
+        # Allow up to 10 consecutive empty reads before giving up.
+        # BLE delivers data in 20-byte notify packets with short gaps between
+        # packets, so a single empty read does not mean the transfer is done.
+        # When ``max_wait`` is given, fail on that wall-clock deadline instead;
+        # the handshake uses a short deadline so a stalled cold link aborts fast
+        # and the caller can retry, rather than blocking ~20 s on empty reads.
+        max_empty = 10
+        while len(buf) < size:
+            chunk = self.serial.read(size - len(buf))
+            if not chunk:
+                empty_reads += 1
+                timed_out = (
+                    (_time.monotonic() - start) >= max_wait
+                    if max_wait is not None
+                    else empty_reads >= max_empty
+                )
+                if timed_out:
+                    raise CloneTransportError(
+                        f"Serial read timed out ({len(buf)}/{size} bytes received)"
+                    )
+                _time.sleep(0.05)
+                continue
+            empty_reads = 0
+            buf.extend(chunk)
+        return bytes(buf)
+
+    def _build_encryption_frame(self) -> Tuple[bytes, bytearray]:
+        frame = bytearray(25)
+        frame[0:4] = b"SEND"
+        frame[4] = (self._rng.randint(1, 2) << 4) | self._rng.randint(0, 4)
+        for index in range(19):
+            frame[5 + index] = self._rng.randint(0, 19)
+        code = frame[4]
+        if code & 0x20:
+            idx = (code - 0x20) * 2 + 1
+        else:
+            idx = (code - 0x10) * 2
+        idx += 1
+        symbol_index = frame[4 + idx]
+        key = bytearray(ENCRYPT_STRINGS[symbol_index])
+        return bytes(frame), key
+
+    def _apply_xor(self, payload: bytearray) -> bytearray:
+        assert self._xor_key is not None, "XOR key not initialised"
+        key = self._xor_key
+        key_idx = 0
+        for i, value in enumerate(payload):
+            k = key[key_idx]
+            key_idx = (key_idx + 1) % len(key)
+            if k != 0x20 and value not in (0x00, 0xFF) and value not in (k, k ^ 0xFF):
+                payload[i] = value ^ k
+        return payload
+
+    @staticmethod
+    def _iter_read_commands(segments: Sequence[CloneSegment]) -> Iterable[Tuple[int, int]]:
+        for segment in segments:
+            for offset in range(0, segment.length, READ_BLOCK):
+                yield segment.read_command, segment.start + offset
+
+    @staticmethod
+    def _iter_write_commands(segments: Sequence[CloneSegment]) -> Iterable[Tuple[int, int]]:
+        for segment in segments:
+            for offset in range(0, segment.length, READ_BLOCK):
+                yield segment.write_command, segment.start + offset
+
+# MIT License
+#
+# Copyright (c) 2026 Nivin Goonesekera - VK3NWG
+# Portions Copyright (c) 2025 Nathan G. Barguss - 2E0NBS
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+
+"""CHIRP driver integration for the Radtel RT-950 Pro."""
+
+LOG = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# CHIRP compatibility layer -------------------------------------------------
+
+# ---------------------------------------------------------------------------
+
+try:  # pragma: no cover - executed when real CHIRP is available
+    from chirp import chirp_common, directory, errors, memmap  # type: ignore
+    from chirp.settings import (
+        RadioSetting,
+        RadioSettingGroup,
+        RadioSettingValueBoolean,
+        RadioSettingValueInteger,
+        RadioSettingValueList,
+        RadioSettingValueString,
+        RadioSettings,
+    )
+
+except ImportError:  # pragma: no cover - fallback for local development
+
+    class _Memory:
+        def __init__(self) -> None:
+            self.number = 0
+            self.freq = 0
+            self.offset = 0
+            self.duplex = ""
+            self.tmode = ""
+            self.rtone = 0.0
+            self.ctone = 0.0
+            self.dtcs = 0
+            self.dtcs_pol = "N"
+            self.mode = "FM"
+            self.power = ""
+            self.skip = ""
+            self.name = ""
+            self.empty = False
+            self.extra = {}
+
+    class _RadioFeatures:
+        def __init__(self) -> None:
+            self.has_bank = False
+            self.has_bank_names = False
+            self.has_name = True
+            self.has_ctone = True
+            self.has_dtcs = True
+            self.has_dtcs_polarity = True
+            self.has_mode = True
+            self.has_offset = True
+            self.has_tuning_step = False
+            self.can_delete = True
+            self.can_odd_split = True
+            self.memory_bounds = (0, 0)
+            self.valid_bands = []
+            self.valid_duplexes = ["", "+", "-", "split"]
+            self.valid_tmodes = ["", "Tone", "TSQL", "DTCS"]
+            self.valid_modes = ["FM", "NFM", "AM"]
+            self.valid_power_levels = ["Low", "Medium", "High"]
+            self.valid_skips = ["", "S"]
+            self.valid_name_length = 12
+
+    class _CloneModeRadio:
+        VENDOR = ""
+        MODEL = ""
+        BAUD_RATE = 115200
+
+        def __init__(self, *args, **kwargs) -> None:
+            self.pipe = kwargs.get("pipe")
+
+    class _Directory:
+        @staticmethod
+        def register(cls):
+            return cls
+
+    class _Errors:
+
+        class RadioError(Exception):
+            pass
+
+    class _MemoryMapBytes(bytearray):
+        def get_packed(self):
+            return bytes(self)
+
+    class memmap:  # type: ignore
+        MemoryMapBytes = _MemoryMapBytes
+
+    class _PowerLevel(str):
+        def __new__(cls, label, watts=0.0):
+            obj = str.__new__(cls, label)
+            obj.watts = watts
+            return obj
+
+    class _RadioSettingValue:
+        def __init__(self, value=None):
+            self._value = value
+
+        def initialize(self):
+            pass
+
+        def set_value(self, value):
+            self._value = value
+
+        def get_value(self):
+            return self._value
+
+        def queue_current(self, value):
+            self._value = value
+
+        def __int__(self):
+            return int(self._value)
+
+        def __bool__(self):
+            return bool(self._value)
+
+        def __str__(self):
+            return str(self._value)
+
+    class RadioSettingValueBoolean(_RadioSettingValue):
+        def __init__(self, current, mem_vals=(0, 1)):
+            super().__init__(bool(current))
+
+        def set_value(self, value):
+            super().set_value(bool(value))
+
+    class RadioSettingValueInteger(_RadioSettingValue):
+        def __init__(self, minval, maxval, current, step=1):
+            self._min = minval
+            self._max = maxval
+            super().__init__(int(current))
+
+        def set_value(self, value):
+            value = int(value)
+            if value < self._min or value > self._max:
+                raise ValueError
+            super().set_value(value)
+
+    class RadioSettingValueList(_RadioSettingValue):
+        def __init__(self, choices, current_index=0):
+            self.choices = list(choices)
+            index = int(current_index) if self.choices else 0
+            super().__init__(self.choices[index] if self.choices else None)
+
+        def set_value(self, value):
+            if isinstance(value, int):
+                if value < 0 or value >= len(self.choices):
+                    raise ValueError
+                self._value = self.choices[value]
+            else:
+                if value not in self.choices:
+                    raise ValueError
+                self._value = value
+
+        def __int__(self):
+            if self._value in self.choices:
+                return self.choices.index(self._value)
+            raise ValueError
+
+    class RadioSettingValueString(_RadioSettingValue):
+        def __init__(self, minlength, maxlength, current, autopad=True, charset=None, mem_pad_char=' '):
+            self.maxlength = maxlength
+            self.autopad = autopad
+            self.mem_pad_char = mem_pad_char
+            super().__init__(current or "")
+
+        def set_value(self, value):
+            value = str(value)
+            if len(value) > self.maxlength:
+                raise ValueError
+            super().set_value(value)
+
+    class RadioSettingGroup:
+        def __init__(self, name, label, *elements):
+            self.name = name
+            self.label = label
+            self._children = []
+            for element in elements:
+                self.append(element)
+
+        def append(self, element):
+            self._children.append(element)
+
+        def __iter__(self):
+            return iter(self._children)
+
+        def get(self, name, default=None):
+            for child in self._children:
+                if isinstance(child, RadioSetting) and child.name == name:
+                    value_obj = getattr(child, 'value', None)
+                    if hasattr(value_obj, 'get_value'):
+                        return value_obj.get_value()
+                    return value_obj
+            return default
+
+        def __getitem__(self, name):
+            result = self.get(name, None)
+            if result is None:
+                raise KeyError(name)
+            return result
+
+        def walk(self):
+            for child in self._children:
+                if isinstance(child, RadioSetting):
+                    yield child
+                elif isinstance(child, RadioSettingGroup):
+                    yield from child.walk()
+
+    class RadioSetting(RadioSettingGroup):
+        def __init__(self, name, label, value):
+            super().__init__(name, label, value)
+            self._value = value
+            self._apply = None
+        @property
+        def value(self):
+            return self._value
+
+        def set_apply_callback(self, callback, *args):
+            self._apply = lambda: callback(self, *args)
+
+        def has_apply_callback(self):
+            return self._apply is not None
+
+        def run_apply_callback(self):
+            if self._apply:
+                self._apply()
+
+        def get_name(self):
+            return self.name
+
+    class RadioSettings(RadioSettingGroup):
+        def __init__(self, *groups):
+            super().__init__('root', 'root', *groups)
+
+    class chirp_common:  # type: ignore
+        Memory = _Memory
+        RadioFeatures = _RadioFeatures
+        CloneModeRadio = _CloneModeRadio
+        PowerLevel = _PowerLevel
+
+        @staticmethod
+        def format_freq(hz):
+            hz = 0 if hz in (None, "") else int(hz)
+            return f"{hz / 1_000_000:.6f}"
+
+        @staticmethod
+        def parse_freq(text):
+            value = str(text).strip().lower()
+            if not value:
+                return 0
+            multiplier = 1_000_000
+            if value.endswith('mhz'):
+                value = value[:-3].strip()
+                multiplier = 1_000_000
+            elif value.endswith('khz'):
+                value = value[:-3].strip()
+                multiplier = 1_000
+            elif value.endswith('hz'):
+                value = value[:-2].strip()
+                multiplier = 1
+            try:
+                numeric = float(value)
+            except ValueError as exc:
+                raise ValueError(f"Invalid frequency '{text}'") from exc
+            if numeric < 0:
+                raise ValueError('Frequency must be non-negative')
+            if multiplier == 1 and numeric >= 1_000_000:
+                return int(round(numeric))
+            if multiplier == 1_000_000 and numeric >= 1_000_000:
+                return int(round(numeric))
+            return int(round(numeric * multiplier))
+    directory = _Directory()  # type: ignore
+    errors = _Errors()  # type: ignore
+
+    class settings:  # type: ignore
+        RadioSettings = RadioSettings
+        RadioSettingGroup = RadioSettingGroup
+        RadioSetting = RadioSetting
+        RadioSettingValueBoolean = RadioSettingValueBoolean
+        RadioSettingValueInteger = RadioSettingValueInteger
+        RadioSettingValueList = RadioSettingValueList
+        RadioSettingValueString = RadioSettingValueString
+    RadioSettings = RadioSettings
+    RadioSettingGroup = RadioSettingGroup
+    RadioSetting = RadioSetting
+    RadioSettingValueBoolean = RadioSettingValueBoolean
+    RadioSettingValueInteger = RadioSettingValueInteger
+    RadioSettingValueList = RadioSettingValueList
+    RadioSettingValueString = RadioSettingValueString
+
+# ---------------------------------------------------------------------------
+# Helper utilities ----------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+
+_SEGMENT_LENGTH = sum(segment.length for segment in DEFAULT_SEGMENTS)
+
+_CHIRP_POWER_LEVELS = [
+    chirp_common.PowerLevel('Low', watts=1.0),
+    chirp_common.PowerLevel('Medium', watts=5.0),
+    chirp_common.PowerLevel('High', watts=10.0),
+]
+
+_POWER_ENUM_TO_CHIRP = {
+    PowerLevel.LOW: _CHIRP_POWER_LEVELS[0],
+    PowerLevel.MEDIUM: _CHIRP_POWER_LEVELS[1],
+    PowerLevel.HIGH: _CHIRP_POWER_LEVELS[2],
+}
+
+_POWER_LABEL_TO_ENUM = {str(level).upper(): enum for enum, level in _POWER_ENUM_TO_CHIRP.items()}
+
+_FUNCTION_UI = {
+    'sql': {'label': 'Squelch Level', 'type': 'int', 'min': 0, 'max': 9},
+    'save_mode': {'label': 'Battery Save', 'type': 'int', 'min': 0, 'max': 3},
+    'vox': {'label': 'VOX Gain', 'type': 'int', 'min': 0, 'max': 9},
+    'vox_delay': {'label': 'VOX Delay', 'type': 'int', 'min': 0, 'max': 9},
+    'auto_backlight': {'label': 'Auto Backlight', 'type': 'int', 'min': 0, 'max': 9},
+    'tot': {'label': 'Time-out Timer', 'type': 'int', 'min': 0, 'max': 9},
+    'beep_prompt': {'label': 'Key Beep', 'type': 'bool'},
+    'voice_prompt': {'label': 'Voice Prompt', 'type': 'enum', 'choices': [('Off', 0), ('English', 1), ('Chinese', 2)]},
+    'language': {'label': 'Menu Language', 'type': 'enum', 'choices': [('English', 0), ('Chinese', 1), ('Other', 2)]},
+    'dtmf_mode': {'label': 'DTMF Mode', 'type': 'enum', 'choices': [('Off', 0), ('DT-ST', 1), ('ANI-ID', 2), ('DTMF', 3)]},
+    'scan_mode': {'label': 'Scan Mode', 'type': 'enum', 'choices': [('Time', 0), ('Carrier', 1), ('Search', 2)]},
+    'ptt_id': {'label': 'PTT ID', 'type': 'enum', 'choices': [('Off', 0), ('BOT', 1), ('EOT', 2), ('Both', 3)]},
+    'display_mode_a': {'label': 'Display Mode A', 'type': 'enum', 'choices': [('Channel', 0), ('Frequency', 1), ('Name', 2)]},
+    'display_mode_b': {'label': 'Display Mode B', 'type': 'enum', 'choices': [('Channel', 0), ('Frequency', 1), ('Name', 2)]},
+    'display_mode_c': {'label': 'Display Mode C', 'type': 'enum', 'choices': [('Channel', 0), ('Frequency', 1), ('Name', 2)]},
+    'auto_key_lock': {'label': 'Auto Key Lock', 'type': 'bool'},
+    'alarm_mode': {'label': 'Alarm Mode', 'type': 'enum', 'choices': [('Local', 0), ('Remote', 1), ('Tone', 2)]},
+    'alarm_sound': {'label': 'Alarm Sound', 'type': 'enum', 'choices': [('Off', 0), ('Type 1', 1), ('Type 2', 2)]},
+    'tail_noise_clear': {'label': 'Tail Noise Clear', 'type': 'bool'},
+    'pass_repeater_noise_clear': {'label': 'Repeater Noise Clear', 'type': 'bool'},
+    'sound_tx_end': {'label': 'Roger Beep', 'type': 'bool'},
+    'fm_radio': {'label': 'FM Radio', 'type': 'bool'},
+    'lock_keyboard': {'label': 'Keypad Lock', 'type': 'bool'},
+    'power_on_message': {'label': 'Power-on Message', 'type': 'enum', 'choices': [('Full', 0), ('Message', 1), ('Voltage', 2)]},
+    'bt_write_switch': {'label': 'Bluetooth Enable', 'type': 'bool'},
+    'vox_switch': {'label': 'VOX Enable', 'type': 'bool'},
+}
+
+_APRS_UI = {
+    'aprs_switch': {'label': 'APRS Enable', 'type': 'bool'},
+    'gps_switch': {'label': 'GPS Enable', 'type': 'bool'},
+    'call_sign': {'label': 'Callsign', 'type': 'string', 'length': 6},
+    'ssid': {'label': 'SSID', 'type': 'enum', 'choices': [(str(i), i) for i in range(16)]},
+    'aprs_priority': {'label': 'Priority', 'type': 'enum', 'choices': [('Low', 0), ('Normal', 1), ('High', 2)]},
+    'data_tx_delay': {'label': 'Data TX Delay', 'type': 'int', 'min': 0, 'max': 9},
+    'aprs_decode_prompt_tone': {'label': 'RX Prompt Tone', 'type': 'bool'},
+    'aprs_rx_auto_popup': {'label': 'RX Auto Popup', 'type': 'bool'},
+    'aprs_forward_channel': {'label': 'Forward Channel', 'type': 'enum', 'choices': [(str(i), i) for i in range(16)]},
+    'aprs_wait_forward': {'label': 'Forward Wait', 'type': 'int', 'min': 0, 'max': 9},
+    'custom_messages': {'label': 'Custom Message', 'type': 'string', 'length': 40},
+}
+
+_DTMF_GROUP_LIMIT = 5
+
+_DTMF_ID_MAXLEN = 5
+
+_DTMF_CODE_MAXLEN = 6
+
+_DTMF_MODE_CHOICES = [('Off', 0), ('BOT', 1), ('EOT', 2), ('Both', 3)]
+
+_VFO_LABELS = ['A', 'B', 'C']
+_VFO_OFFSET_CHOICES = [('Simplex', 0), ('Plus (+)', 1), ('Minus (-)', 2), ('Split', 3)]
+_VFO_BANDWIDTH_CHOICES = [('Narrow', Bandwidth.NARROW), ('Wide', Bandwidth.WIDE)]
+_VFO_MODULATION_CHOICES = [('FM', Modulation.FM), ('AM', Modulation.AM)]
+_VFO_POWER_CHOICES = [('Low', PowerLevel.LOW), ('Medium', PowerLevel.MEDIUM), ('High', PowerLevel.HIGH)]
+_VFO_ENCRYPTION_CHOICES = [('Off', 0), ('Type 1', 1), ('Type 2', 2), ('Type 3', 3)]
+_VFO_BAND_CHOICES = [
+    ('50-76 MHz', 0),
+    ('108-136 MHz', 1),
+    ('137-174 MHz', 2),
+    ('174-350 MHz', 3),
+    ('350-400 MHz', 4),
+    ('400-470 MHz', 5),
+    ('470-600 MHz', 6),
+]
+_VFO_STEP_CHOICES = [
+    ('2.5 kHz', 0),
+    ('5.0 kHz', 1),
+    ('6.25 kHz', 2),
+    ('10.0 kHz', 3),
+    ('12.5 kHz', 4),
+    ('25.0 kHz', 5),
+]
+
+def _build_memory_extra(channel: ChannelRecord) -> RadioSettingGroup:
+    group = RadioSettingGroup('rt950_extra', 'RT-950 Pro Extras')
+    scrambler_value = RadioSettingValueInteger(0, 8, channel.scrambler or 0)
+    scrambler = RadioSetting('scrambler', 'Scrambler Code', scrambler_value)
+    group.append(scrambler)
+    encryption_raw = channel.encryption if channel.encryption is not None else 0
+    encryption_value = RadioSettingValueInteger(0, 3, encryption_raw)
+    encryption = RadioSetting('encryption', 'Encryption Mode', encryption_value)
+    group.append(encryption)
+    return group
+
+def _extract_memory_extra(mem) -> Dict[str, int]:
+    extras: Dict[str, int] = {}
+    container = getattr(mem, 'extra', None)
+    if isinstance(container, dict):
+        for key in ('scrambler', 'encryption'):
+            value = container.get(key)
+            if value is not None:
+                extras[key] = value
+        return extras
+    if container is None:
+        return extras
+    if hasattr(container, 'walk'):
+        iterable = list(container.walk())
+    else:
+        try:
+            iterable = list(container)
+        except TypeError:
+            iterable = []
+    for setting in iterable:
+        if not isinstance(setting, RadioSetting):
+            continue
+        value_obj = getattr(setting, 'value', None)
+        if hasattr(value_obj, 'get_value'):
+            raw = value_obj.get_value()
+        else:
+            raw = value_obj
+        extras[setting.get_name()] = raw
+    return extras
+
+def _format_frequency(hz: Optional[int]) -> str:
+    if hz in (None, 0):
+        return ""
+    return chirp_common.format_freq(hz)
+
+def _parse_frequency(text: str) -> Optional[int]:
+    value = text.strip()
+    if not value:
+        return None
+    hz = chirp_common.parse_freq(value)
+    if hz <= 0:
+        raise ValueError("Frequency must be positive")
+    return hz
+
+def _make_bool_setting(name: str, label: str, current: bool, callback, *args) -> RadioSetting:
+    value = RadioSettingValueBoolean(bool(current))
+    setting = RadioSetting(name, label, value)
+    setting.set_apply_callback(callback, *args)
+    return setting
+
+def _make_integer_setting(name: str, label: str, current: Optional[int], minimum: int, maximum: int, callback, *args) -> RadioSetting:
+    active = minimum if current is None else int(current)
+    setting = RadioSetting(name, label, RadioSettingValueInteger(minimum, maximum, active))
+    setting.set_apply_callback(callback, *args)
+    return setting
+
+def _build_vfo_group(vfos: Optional[List[VFOSettings]]) -> RadioSettingGroup:
+    group = RadioSettingGroup('vfo', 'VFO Profiles')
+    if not vfos:
+        return group
+    for idx, vfo in enumerate(vfos):
+        label = _VFO_LABELS[idx] if idx < len(_VFO_LABELS) else str(idx)
+        subgroup = RadioSettingGroup(f'vfo.{idx}', f'VFO {label}')
+
+        freq_value = RadioSettingValueString(0, 12, _format_frequency(vfo.rx_hz) or '', autopad=False)
+        freq_setting = RadioSetting(f'vfo.{idx}.freq', 'RX Frequency', freq_value)
+        freq_setting.set_apply_callback(_apply_vfo_frequency, vfo)
+        subgroup.append(freq_setting)
+
+        offset_labels = [label for label, _ in _VFO_OFFSET_CHOICES]
+        offset_values = [value for _, value in _VFO_OFFSET_CHOICES]
+        offset_index = offset_values.index(vfo.offset_direction) if vfo.offset_direction in offset_values else 0
+        offset_setting = RadioSetting(
+            f'vfo.{idx}.offset_direction',
+            'Offset Direction',
+            RadioSettingValueList(offset_labels, current_index=offset_index),
+        )
+        offset_setting.set_apply_callback(_apply_vfo_offset_direction, vfo)
+        subgroup.append(offset_setting)
+
+        offset_value = RadioSettingValueString(0, 12, _format_frequency(vfo.offset_hz) or '', autopad=False)
+        offset_setting_value = RadioSetting(f'vfo.{idx}.offset', 'Offset Frequency', offset_value)
+        offset_setting_value.set_apply_callback(_apply_vfo_offset, vfo)
+        subgroup.append(offset_setting_value)
+
+        power_labels = [label for label, _ in _VFO_POWER_CHOICES]
+        power_values = [value for _, value in _VFO_POWER_CHOICES]
+        power_index = power_values.index(vfo.tx_power) if vfo.tx_power in power_values else 0
+        power_setting = RadioSetting(
+            f'vfo.{idx}.power',
+            'TX Power',
+            RadioSettingValueList(power_labels, current_index=power_index),
+        )
+        power_setting.set_apply_callback(_apply_vfo_power, vfo)
+        subgroup.append(power_setting)
+
+        bandwidth_labels = [label for label, _ in _VFO_BANDWIDTH_CHOICES]
+        bandwidth_values = [value for _, value in _VFO_BANDWIDTH_CHOICES]
+        bandwidth_index = bandwidth_values.index(vfo.bandwidth) if vfo.bandwidth in bandwidth_values else 0
+        bandwidth_setting = RadioSetting(
+            f'vfo.{idx}.bandwidth',
+            'Bandwidth',
+            RadioSettingValueList(bandwidth_labels, current_index=bandwidth_index),
+        )
+        bandwidth_setting.set_apply_callback(_apply_vfo_bandwidth, vfo)
+        subgroup.append(bandwidth_setting)
+
+        modulation_labels = [label for label, _ in _VFO_MODULATION_CHOICES]
+        modulation_values = [value for _, value in _VFO_MODULATION_CHOICES]
+        modulation_index = modulation_values.index(vfo.rx_modulation) if vfo.rx_modulation in modulation_values else 0
+        modulation_setting = RadioSetting(
+            f'vfo.{idx}.modulation',
+            'RX Modulation',
+            RadioSettingValueList(modulation_labels, current_index=modulation_index),
+        )
+        modulation_setting.set_apply_callback(_apply_vfo_modulation, vfo)
+        subgroup.append(modulation_setting)
+
+        subgroup.append(_make_bool_setting(f'vfo.{idx}.busy_lockout', 'Busy Lockout', vfo.busy_lockout, _apply_vfo_busy_lockout, vfo))
+        subgroup.append(_make_bool_setting(f'vfo.{idx}.fhss', 'Learn FHSS', vfo.learn_fhss, _apply_vfo_learn_fhss, vfo))
+
+        scrambler_setting = RadioSetting(
+            f'vfo.{idx}.scrambler',
+            'Scrambler Code',
+            RadioSettingValueInteger(0, 9, int(vfo.scrambler)),
+        )
+        scrambler_setting.set_apply_callback(_apply_vfo_scrambler, vfo)
+        subgroup.append(scrambler_setting)
+
+        encryption_labels = [label for label, _ in _VFO_ENCRYPTION_CHOICES]
+        encryption_values = [value for _, value in _VFO_ENCRYPTION_CHOICES]
+        encryption_index = encryption_values.index(vfo.encryption) if vfo.encryption in encryption_values else 0
+        encryption_setting = RadioSetting(
+            f'vfo.{idx}.encryption',
+            'Encryption Mode',
+            RadioSettingValueList(encryption_labels, current_index=encryption_index),
+        )
+        encryption_setting.set_apply_callback(_apply_vfo_encryption, vfo)
+        subgroup.append(encryption_setting)
+
+        step_labels = [label for label, _ in _VFO_STEP_CHOICES]
+        step_values = [value for _, value in _VFO_STEP_CHOICES]
+        step_index = step_values.index(vfo.step_freq_index) if vfo.step_freq_index in step_values else 0
+        step_setting = RadioSetting(
+            f'vfo.{idx}.step',
+            'Step Size',
+            RadioSettingValueList(step_labels, current_index=step_index),
+        )
+        step_setting.set_apply_callback(_apply_vfo_step, vfo)
+        subgroup.append(step_setting)
+
+        band_labels = [label for label, _ in _VFO_BAND_CHOICES]
+        band_values = [value for _, value in _VFO_BAND_CHOICES]
+        band_index = band_values.index(vfo.freq_band) if vfo.freq_band in band_values else 0
+        freq_band_setting = RadioSetting(
+            f'vfo.{idx}.freq_band',
+            'Frequency Band',
+            RadioSettingValueList(band_labels, current_index=band_index),
+        )
+        freq_band_setting.set_apply_callback(_apply_vfo_freq_band, vfo)
+        subgroup.append(freq_band_setting)
+
+        signalling_setting = RadioSetting(
+            f'vfo.{idx}.signalling_group',
+            'Signalling Group',
+            RadioSettingValueInteger(0, 15, int(vfo.signalling_group)),
+        )
+        signalling_setting.set_apply_callback(_apply_vfo_signalling, vfo)
+        subgroup.append(signalling_setting)
+
+        group.append(subgroup)
+    return group
+
+def _build_modulation_group(modulation: ModulationSettings) -> RadioSettingGroup:
+    group = RadioSettingGroup('modulation', 'Broadcast/Modulation')
+    global_group = RadioSettingGroup('modulation.global', 'Global Settings')
+    global_group.append(_make_integer_setting('modulation.fm_current_channel', 'FM Current Channel', modulation.fm_current_channel, 0, 15, _apply_modulation_int, modulation, 'fm_current_channel'))
+    global_group.append(_make_integer_setting('modulation.am_current_channel', 'AM Current Channel', modulation.am_current_channel, 0, 15, _apply_modulation_int, modulation, 'am_current_channel'))
+    global_group.append(_make_integer_setting('modulation.ssb_current_channel', 'SSB Current Channel', modulation.ssb_current_channel, 0, 15, _apply_modulation_int, modulation, 'ssb_current_channel'))
+    global_group.append(_make_integer_setting('modulation.work_mode', 'Work Mode', modulation.work_mode, 0, 3, _apply_modulation_int, modulation, 'work_mode'))
+    global_group.append(_make_integer_setting('modulation.modulation_mode', 'Modulation Mode', modulation.modulation_mode, 0, 5, _apply_modulation_int, modulation, 'modulation_mode'))
+    global_group.append(_make_integer_setting('modulation.am_step', 'AM Step Index', modulation.am_step_index, 0, 7, _apply_modulation_int, modulation, 'am_step_index'))
+    global_group.append(_make_integer_setting('modulation.am_rx_gain', 'AM RX Gain', modulation.am_rx_gain, 0, 255, _apply_modulation_int, modulation, 'am_rx_gain'))
+    global_group.append(_make_integer_setting('modulation.ssb_step', 'SSB Step Index', modulation.ssb_step_index, 0, 7, _apply_modulation_int, modulation, 'ssb_step_index'))
+    global_group.append(_make_integer_setting('modulation.ssb_rx_gain', 'SSB RX Gain', modulation.ssb_rx_gain, 0, 255, _apply_modulation_int, modulation, 'ssb_rx_gain'))
+    group.append(global_group)
+
+    if modulation.channels:
+        group.append(_build_modulation_channel_group('modulation.fm_channels', 'FM Broadcast Channels', modulation, 'fm'))
+        group.append(_build_modulation_channel_group('modulation.am_channels', 'AM Broadcast Channels', modulation, 'am'))
+        group.append(_build_modulation_channel_group('modulation.ssb_channels', 'SSB Channels', modulation, 'ssb'))
+    return group
+
+def _build_modulation_channel_group(name_prefix: str, label: str, modulation: ModulationSettings, mode: str) -> RadioSettingGroup:
+    subgroup = RadioSettingGroup(name_prefix, label)
+    for idx, channel in enumerate(modulation.channels):
+        channel_group = RadioSettingGroup(f'{name_prefix}.{idx}', f'Channel {idx + 1}')
+        if mode == 'fm':
+            freq_setting = RadioSetting(
+                f'{name_prefix}.{idx}.freq',
+                'Frequency',
+                RadioSettingValueString(0, 12, _format_frequency(channel.fm_frequency) or '', autopad=False),
+            )
+            freq_setting.set_apply_callback(_apply_modulation_channel_frequency, modulation, idx, 'fm_frequency')
+            channel_group.append(freq_setting)
+            name_setting = RadioSetting(
+                f'{name_prefix}.{idx}.name',
+                'Name',
+                RadioSettingValueString(0, 16, channel.fm_name or '', autopad=False),
+            )
+            name_setting.set_apply_callback(_apply_modulation_channel_name, modulation, idx, 'fm_name')
+            channel_group.append(name_setting)
+        elif mode == 'am':
+            freq_setting = RadioSetting(
+                f'{name_prefix}.{idx}.freq',
+                'Frequency',
+                RadioSettingValueString(0, 12, _format_frequency(channel.am_frequency) or '', autopad=False),
+            )
+            freq_setting.set_apply_callback(_apply_modulation_channel_frequency, modulation, idx, 'am_frequency')
+            channel_group.append(freq_setting)
+            name_setting = RadioSetting(
+                f'{name_prefix}.{idx}.name',
+                'Name',
+                RadioSettingValueString(0, 16, channel.am_name or '', autopad=False),
+            )
+            name_setting.set_apply_callback(_apply_modulation_channel_name, modulation, idx, 'am_name')
+            channel_group.append(name_setting)
+        elif mode == 'ssb':
+            freq_setting = RadioSetting(
+                f'{name_prefix}.{idx}.freq',
+                'Frequency',
+                RadioSettingValueString(0, 12, _format_frequency(channel.ssb_frequency) or '', autopad=False),
+            )
+            freq_setting.set_apply_callback(_apply_modulation_channel_frequency, modulation, idx, 'ssb_frequency')
+            channel_group.append(freq_setting)
+            bandwidth_setting = _make_integer_setting(
+                f'{name_prefix}.{idx}.bandwidth',
+                'Bandwidth',
+                channel.ssb_bandwidth,
+                0,
+                255,
+                _apply_modulation_channel_int,
+                modulation,
+                idx,
+                'ssb_bandwidth'
+            )
+            channel_group.append(bandwidth_setting)
+            beat_setting = RadioSetting(
+                f'{name_prefix}.{idx}.beat',
+                'Beat Offset',
+                RadioSettingValueInteger(-32768, 32767, int(channel.ssb_beat_offset or 0)),
+            )
+            beat_setting.set_apply_callback(_apply_modulation_channel_beat, modulation, idx)
+            channel_group.append(beat_setting)
+            name_setting = RadioSetting(
+                f'{name_prefix}.{idx}.name',
+                'Name',
+                RadioSettingValueString(0, 16, channel.ssb_name or '', autopad=False),
+            )
+            name_setting.set_apply_callback(_apply_modulation_channel_name, modulation, idx, 'ssb_name')
+            channel_group.append(name_setting)
+        subgroup.append(channel_group)
+    return subgroup
+
+def _apply_modulation_int(rsetting, modulation, attr):
+    setattr(modulation, attr, max(0, _value_as_int(rsetting.value)))
+
+def _apply_modulation_channel_frequency(rsetting, modulation, index, attr):
+    try:
+        value = _value_as_string(rsetting.value).strip()
+    except AttributeError:
+        value = str(rsetting.value).strip()
+    freq = _parse_frequency(value) if value else None
+    setattr(modulation.channels[index], attr, freq)
+
+def _apply_modulation_channel_name(rsetting, modulation, index, attr):
+    name = _value_as_string(rsetting.value)
+    setattr(modulation.channels[index], attr, name)
+
+def _apply_modulation_channel_int(rsetting, modulation, index, attr):
+    value = max(0, _value_as_int(rsetting.value))
+    setattr(modulation.channels[index], attr, value)
+
+def _apply_modulation_channel_beat(rsetting, modulation, index):
+    value = _value_as_int(rsetting.value)
+    if value < -32768:
+        value = -32768
+    elif value > 32767:
+        value = 32767
+    modulation.channels[index].ssb_beat_offset = value
+
+def _apply_vfo_frequency(rsetting, vfo):
+    try:
+        value = _value_as_string(rsetting.value).strip()
+    except AttributeError:
+        value = str(rsetting.value).strip()
+    if not value:
+        vfo.rx_hz = None
+        return
+    try:
+        vfo.rx_hz = _parse_frequency(value)
+    except ValueError as exc:
+        raise errors.RadioError(str(exc)) from exc
+
+def _apply_vfo_offset_direction(rsetting, vfo):
+    index = _value_as_index(rsetting.value, _VFO_OFFSET_CHOICES)
+    vfo.offset_direction = _VFO_OFFSET_CHOICES[index][1]
+
+def _apply_vfo_offset(rsetting, vfo):
+    try:
+        value = _value_as_string(rsetting.value).strip()
+    except AttributeError:
+        value = str(rsetting.value).strip()
+    if not value:
+        vfo.offset_hz = None
+        return
+    try:
+        vfo.offset_hz = _parse_frequency(value)
+    except ValueError as exc:
+        raise errors.RadioError(str(exc)) from exc
+
+def _apply_vfo_power(rsetting, vfo):
+    index = _value_as_index(rsetting.value, _VFO_POWER_CHOICES)
+    vfo.tx_power = _VFO_POWER_CHOICES[index][1]
+
+def _apply_vfo_bandwidth(rsetting, vfo):
+    index = _value_as_index(rsetting.value, _VFO_BANDWIDTH_CHOICES)
+    vfo.bandwidth = _VFO_BANDWIDTH_CHOICES[index][1]
+
+def _apply_vfo_modulation(rsetting, vfo):
+    index = _value_as_index(rsetting.value, _VFO_MODULATION_CHOICES)
+    vfo.rx_modulation = _VFO_MODULATION_CHOICES[index][1]
+
+def _apply_vfo_busy_lockout(rsetting, vfo):
+    vfo.busy_lockout = bool(_value_as_bool(rsetting.value))
+
+def _apply_vfo_learn_fhss(rsetting, vfo):
+    vfo.learn_fhss = bool(_value_as_bool(rsetting.value))
+
+def _apply_vfo_scrambler(rsetting, vfo):
+    vfo.scrambler = max(0, _value_as_int(rsetting.value)) & 0x0F
+
+def _apply_vfo_encryption(rsetting, vfo):
+    index = _value_as_index(rsetting.value, _VFO_ENCRYPTION_CHOICES)
+    vfo.encryption = _VFO_ENCRYPTION_CHOICES[index][1]
+
+def _apply_vfo_step(rsetting, vfo):
+    index = _value_as_index(rsetting.value, _VFO_STEP_CHOICES)
+    vfo.step_freq_index = _VFO_STEP_CHOICES[index][1]
+
+def _apply_vfo_freq_band(rsetting, vfo):
+    vfo.freq_band = max(0, _value_as_int(rsetting.value)) & 0x0F
+
+def _apply_vfo_signalling(rsetting, vfo):
+    vfo.signalling_group = max(0, _value_as_int(rsetting.value)) & 0x0F
+
+def _build_setting_value(meta, current):
+    kind = meta['type']
+    if kind == 'bool':
+        return RadioSettingValueBoolean(bool(current))
+    if kind == 'int':
+        minimum = meta.get('min', 0)
+        maximum = meta.get('max', minimum)
+        active = minimum if current is None else int(current)
+        return RadioSettingValueInteger(minimum, maximum, active)
+    if kind == 'enum':
+        choices = meta['choices']
+        labels = [label for label, _ in choices]
+        values = [value for _, value in choices]
+        active = values[0]
+        if current in values:
+            active = current
+        index = values.index(active)
+        return RadioSettingValueList(labels, current_index=index)
+    if kind == 'string':
+        length = meta['length']
+        return RadioSettingValueString(0, length, (current or ''), autopad=False)
+    raise SettingsError(f"Unsupported setting type: {kind}")
+
+def _value_as_bool(value_obj):
+    if hasattr(value_obj, 'get_value'):
+        return bool(value_obj.get_value())
+    return bool(value_obj)
+
+def _value_as_int(value_obj, default=0):
+    try:
+        if hasattr(value_obj, 'get_value'):
+            raw = value_obj.get_value()
+        else:
+            raw = value_obj
+        return int(raw)
+    except Exception:
+        return default
+
+def _value_as_index(value_obj, choices):
+    try:
+        return int(value_obj)
+    except Exception:
+        if hasattr(value_obj, 'get_value'):
+            raw = value_obj.get_value()
+        else:
+            raw = value_obj
+        labels = [label for label, _ in choices]
+        try:
+            return labels.index(raw)
+        except ValueError:
+            return 0
+
+def _value_as_string(value_obj):
+    if hasattr(value_obj, 'get_value'):
+        raw = value_obj.get_value()
+    else:
+        raw = value_obj
+    return str(raw)
+
+def _create_function_setting(func_settings, key, meta):
+    try:
+        current = get_function_value(func_settings, key)
+    except KeyError:
+        LOG.debug('Skipping unknown function key %s', key)
+        return None
+    value_obj = _build_setting_value(meta, current)
+    rsetting = RadioSetting(f'function.{key}', meta['label'], value_obj)
+    rsetting.set_apply_callback(_apply_function_setting, func_settings, key, meta)
+    return rsetting
+
+def _create_aprs_setting(aprs_settings, key, meta):
+    try:
+        current = get_aprs_value(aprs_settings, key)
+    except KeyError:
+        LOG.debug('Skipping unknown APRS key %s', key)
+        return None
+    value_obj = _build_setting_value(meta, current)
+    rsetting = RadioSetting(f'aprs.{key}', meta['label'], value_obj)
+    rsetting.set_apply_callback(_apply_aprs_setting, aprs_settings, key, meta)
+    return rsetting
+
+def _build_function_group(func_settings):
+    group = RadioSettingGroup('function', 'Function Settings')
+    for key, meta in _FUNCTION_UI.items():
+        setting = _create_function_setting(func_settings, key, meta)
+        if setting is not None:
+            group.append(setting)
+    return group
+
+def _build_aprs_group(aprs_settings):
+    group = RadioSettingGroup('aprs', 'APRS Settings')
+    for key, meta in _APRS_UI.items():
+        setting = _create_aprs_setting(aprs_settings, key, meta)
+        if setting is not None:
+            group.append(setting)
+    return group
+
+def _build_dtmf_group(dtmf_settings):
+    group = RadioSettingGroup('dtmf', 'DTMF Settings')
+    current_id = get_dtmf_current_id(dtmf_settings)
+    value_id = RadioSettingValueString(0, _DTMF_ID_MAXLEN, current_id or '', autopad=False)
+    rset_id = RadioSetting('dtmf.current_id', 'Current ID', value_id)
+    rset_id.set_apply_callback(_apply_dtmf_id, dtmf_settings)
+    group.append(rset_id)
+    mode = get_dtmf_ptt_mode(dtmf_settings)
+    labels = [label for label, _ in _DTMF_MODE_CHOICES]
+    values = [value for _, value in _DTMF_MODE_CHOICES]
+    index = values.index(mode) if mode in values else 0
+    mode_value = RadioSettingValueList(labels, current_index=index)
+    rset_mode = RadioSetting('dtmf.ptt_mode', 'PTT ID Mode', mode_value)
+    rset_mode.set_apply_callback(_apply_dtmf_mode, dtmf_settings)
+    group.append(rset_mode)
+    for idx in range(_DTMF_GROUP_LIMIT):
+        try:
+            code = get_dtmf_code_group(dtmf_settings, idx)
+        except IndexError:
+            code = ''
+        code_value = RadioSettingValueString(0, _DTMF_CODE_MAXLEN, code or '', autopad=False)
+        rset_code = RadioSetting(f'dtmf.code_group_{idx + 1}', f'Code Group {idx + 1}', code_value)
+        rset_code.set_apply_callback(_apply_dtmf_group, dtmf_settings, idx)
+        group.append(rset_code)
+    return group
+
+def _apply_function_setting(rsetting, func_settings, key, meta):
+    try:
+        kind = meta['type']
+        if kind == 'bool':
+            set_function_value(func_settings, key, _value_as_bool(rsetting.value))
+        elif kind == 'int':
+            set_function_value(func_settings, key, _value_as_int(rsetting.value))
+        elif kind == 'enum':
+            index = _value_as_index(rsetting.value, meta['choices'])
+            set_function_value(func_settings, key, meta['choices'][index][1])
+        else:
+            raise SettingsError(f"Unsupported function setting type {kind}")
+    except (SettingsError, KeyError, IndexError, ValueError) as exc:
+        raise errors.RadioError(str(exc)) from exc
+
+def _apply_aprs_setting(rsetting, aprs_settings, key, meta):
+    try:
+        kind = meta['type']
+        if kind == 'bool':
+            set_aprs_value(aprs_settings, key, _value_as_bool(rsetting.value))
+        elif kind == 'int':
+            set_aprs_value(aprs_settings, key, _value_as_int(rsetting.value))
+        elif kind == 'enum':
+            index = _value_as_index(rsetting.value, meta['choices'])
+            set_aprs_value(aprs_settings, key, meta['choices'][index][1])
+        elif kind == 'string':
+            set_aprs_value(aprs_settings, key, _value_as_string(rsetting.value).strip())
+        else:
+            raise SettingsError(f"Unsupported APRS setting type {kind}")
+    except (SettingsError, KeyError, IndexError, ValueError) as exc:
+        raise errors.RadioError(str(exc)) from exc
+
+def _apply_dtmf_id(rsetting, dtmf_settings):
+    try:
+        set_dtmf_current_id(dtmf_settings, _value_as_string(rsetting.value).strip())
+    except SettingsError as exc:
+        raise errors.RadioError(str(exc)) from exc
+
+def _apply_dtmf_mode(rsetting, dtmf_settings):
+    try:
+        index = _value_as_index(rsetting.value, _DTMF_MODE_CHOICES)
+        set_dtmf_ptt_mode(dtmf_settings, _DTMF_MODE_CHOICES[index][1])
+    except SettingsError as exc:
+        raise errors.RadioError(str(exc)) from exc
+
+def _apply_dtmf_group(rsetting, dtmf_settings, index):
+    try:
+        set_dtmf_code_group(dtmf_settings, index, _value_as_string(rsetting.value).strip())
+    except (SettingsError, IndexError) as exc:
+        raise errors.RadioError(str(exc)) from exc
+
+def _build_clone_payload(image: RadioImage) -> bytes:
+    """Compose the raw buffer expected by the radio from ``image``."""
+    buffer = image.to_bytes()
+    payload = bytearray()
+    payload.extend(buffer[:CHANNEL_SECTION_BYTES])
+    cursor = CHANNEL_SECTION_BYTES
+    for segment in DEFAULT_SEGMENTS[1:]:
+        end = cursor + segment.length
+        payload.extend(buffer[cursor:end])
+        cursor = end
+    if len(payload) != _SEGMENT_LENGTH:
+        raise ValueError(
+            f"Composed payload length {len(payload)} does not match expected {_SEGMENT_LENGTH}"
+        )
+    return bytes(payload)
+
+@dataclass
+class _ToneInfo:
+    mode: str = ""
+    rtone: float = 0.0
+    ctone: float = 0.0
+    dtcs: int = 0
+    polarity: str = "N"
+
+# ---------------------------------------------------------------------------
+# Driver implementation -----------------------------------------------------
+
+# ---------------------------------------------------------------------------
+
+class RT950ProRadio(chirp_common.CloneModeRadio):
+    _memsize = 33152
+    """RT-950 Pro CHIRP driver."""
+    VENDOR = "Radtel"
+    MODEL = "RT-950 Pro"
+    BAUD_RATE = 9600
+
+    def __init__(self, *args, **kwargs) -> None:
+        self._image: Optional[RadioImage] = None
+        self._memory_cache: dict[int, chirp_common.Memory] = {}
+        super().__init__(*args, **kwargs)
+    # ------------------------------------------------------------------
+    # CHIRP hooks
+    # ------------------------------------------------------------------
+
+    def get_features(self):  # type: ignore[override]
+        rf = chirp_common.RadioFeatures()
+        rf.memory_bounds = (0, CHANNEL_COUNT - 1)
+        rf.valid_bands = [
+            (18_000_000, 64_000_000),   # Low HF confirmed RX/TX (FM only)
+            (118_000_000, 137_000_000), # Airband RX (AM only, TX disabled)
+            (70_000_000, 118_000_000),  # Lower VHF before airband
+            (136_000_000, 174_000_000),
+            (174_000_000, 400_000_000),
+            (400_000_000, 480_000_000),
+            (480_000_000, 580_000_000),
+        ]
+        rf.has_bank = False
+        rf.has_bank_names = False
+        rf.has_settings = True
+        rf.has_name = True
+        rf.has_ctone = True
+        rf.has_dtcs = True
+        rf.has_dtcs_polarity = True
+        rf.has_mode = True
+        rf.has_offset = True
+        rf.has_tuning_step = False
+        rf.can_delete = True
+        rf.can_odd_split = True
+        rf.valid_tmodes = ["", "Tone", "TSQL", "DTCS"]
+        rf.valid_duplexes = ["", "+", "-", "split"]
+        rf.valid_modes = ["FM", "NFM", "AM"]
+        rf.valid_power_levels = _CHIRP_POWER_LEVELS
+        rf.valid_skips = ["", "S"]
+        rf.valid_dtcs_pols = ["NN", "NR", "RN", "RR"]
+        # Use CHIRP's standard DCS code list; do not include 0/"000"
+        # to avoid invalid DTCS state during CSV export.
+        rf.valid_dtcs_codes = list(chirp_common.DTCS_CODES)
+        rf.valid_tuning_steps = [2.5, 5.0, 6.25, 8.33, 10.0, 12.5, 25.0]
+        rf.valid_characters = chirp_common.CHARSET_ASCII
+        rf.valid_name_length = 12
+        return rf
+
+    def process_mmap(self):  # type: ignore[override]
+        mmap_obj = getattr(self, '_mmap', None)
+        if mmap_obj is None:
+            self._image = None
+            return
+        if hasattr(mmap_obj, 'get_packed'):
+            data = mmap_obj.get_packed()
+        else:
+            data = bytes(mmap_obj)
+        if not data:
+            self._image = None
+            return
+        try:
+            self._image = RadioImage.from_bytes(data)
+        except ValueError as exc:
+            raise errors.RadioError(f'Failed to parse memory map: {exc}') from exc
+        self._memory_cache.clear()
+
+    def sync_in(self):  # type: ignore[override]
+        if self.pipe is None:
+            raise errors.RadioError("Serial pipe not initialised")
+        transport = CloneSerialTransport(self.pipe, logger=LOG)
+        # Hook progress into CHIRP status if available
+        status = None
+        try:
+            status = chirp_common.Status()
+            status.msg = "Cloning from radio…"
+            status.max = 0
+        except Exception:
+            status = None
+        if status is not None and hasattr(self, "status_fn"):
+            blocks_per_segment = [seg.length // READ_BLOCK for seg in DEFAULT_SEGMENTS]
+            seg_labels = [
+                "Channels",
+                "VFO settings",
+                "Function settings",
+                "DTMF settings",
+                "Modulation params",
+                "Modulation names",
+                "APRS settings",
+            ]
+
+            def _progress(done: int, total: int, phase: str) -> None:
+                try:
+                    block_index = max(0, int(done) - 1)
+                    seg_idx = 0
+                    offset_blocks = block_index
+                    for count in blocks_per_segment:
+                        if offset_blocks < count:
+                            break
+                        offset_blocks -= count
+                        seg_idx += 1
+                    direction = "Reading" if phase == "read" else "Writing"
+                    if seg_idx == 0:
+                        per_block = max(1, READ_BLOCK // CHANNEL_SIZE)
+                        start_ch = offset_blocks * per_block + 1
+                        end_ch = min(start_ch + per_block - 1, CHANNEL_SECTION_BYTES // CHANNEL_SIZE)
+                        status.msg = f"{direction} channels {start_ch:03d}-{end_ch:03d}…"
+                    else:
+                        status.msg = f"{direction} {seg_labels[seg_idx]}…"
+                    status.cur = done
+                    status.max = total
+                    self.status_fn(status)
+                except Exception:
+                    pass
+            transport.progress_cb = _progress
+        try:
+            raw = transport.read_clone()
+        except Exception as exc:
+            raise errors.RadioError(f'Clone read failed: {exc}') from exc
+        self._image = RadioImage.from_bytes(raw)
+        self._mmap = memmap.MemoryMapBytes(raw)
+        self._metadata = {}
+        self._memory_cache.clear()
+
+    def sync_out(self):  # type: ignore[override]
+        if self.pipe is None:
+            raise errors.RadioError("Serial pipe not initialised")
+        if self._image is None:
+            raise errors.RadioError("No image loaded")
+        payload = _build_clone_payload(self._image)
+        transport = CloneSerialTransport(self.pipe, logger=LOG)
+        status = None
+        try:
+            status = chirp_common.Status()
+            status.msg = "Cloning to radio…"
+            status.max = 0
+        except Exception:
+            status = None
+        if status is not None and hasattr(self, "status_fn"):
+            blocks_per_segment = [seg.length // READ_BLOCK for seg in DEFAULT_SEGMENTS]
+            seg_labels = [
+                "Channels",
+                "VFO settings",
+                "Function settings",
+                "DTMF settings",
+                "Modulation params",
+                "Modulation names",
+                "APRS settings",
+            ]
+
+            def _progress(done: int, total: int, phase: str) -> None:
+                try:
+                    block_index = max(0, int(done) - 1)
+                    seg_idx = 0
+                    offset_blocks = block_index
+                    for count in blocks_per_segment:
+                        if offset_blocks < count:
+                            break
+                        offset_blocks -= count
+                        seg_idx += 1
+                    direction = "Reading" if phase == "read" else "Writing"
+                    if seg_idx == 0:
+                        per_block = max(1, READ_BLOCK // CHANNEL_SIZE)
+                        start_ch = offset_blocks * per_block + 1
+                        end_ch = min(start_ch + per_block - 1, CHANNEL_SECTION_BYTES // CHANNEL_SIZE)
+                        status.msg = f"{direction} channels {start_ch:03d}-{end_ch:03d}…"
+                    else:
+                        status.msg = f"{direction} {seg_labels[seg_idx]}…"
+                    status.cur = done
+                    status.max = total
+                    self.status_fn(status)
+                except Exception:
+                    pass
+            transport.progress_cb = _progress
+        try:
+            transport.write_clone(payload)
+        except Exception as exc:
+            raise errors.RadioError(f'Clone write failed: {exc}') from exc
+        self._mmap = memmap.MemoryMapBytes(payload)
+        self._metadata = {}
+    # ------------------------------------------------------------------
+    # Settings integration
+    # ------------------------------------------------------------------
+
+    def get_settings(self):  # type: ignore[override]
+        image = self._require_image()
+        groups = []
+        if getattr(image, 'vfo', None):
+            groups.append(_build_vfo_group(image.vfo))
+        if getattr(image, 'modulation', None) is not None:
+            groups.append(_build_modulation_group(image.modulation))
+        if getattr(image, 'function', None) is not None:
+            groups.append(_build_function_group(image.function))
+        if getattr(image, 'aprs', None) is not None:
+            groups.append(_build_aprs_group(image.aprs))
+        if getattr(image, 'dtmf', None) is not None:
+            groups.append(_build_dtmf_group(image.dtmf))
+        if not groups:
+            return RadioSettings()
+        return RadioSettings(*groups)
+
+    def set_settings(self, settings):  # type: ignore[override]
+        self._require_image()
+        if not isinstance(settings, RadioSettings):
+            raise errors.RadioError('Unexpected settings container')
+        walker = getattr(settings, 'walk', None)
+        if walker is None:
+            raise errors.RadioError('Settings container missing walk()')
+        for element in walker():
+            if isinstance(element, RadioSetting) and element.has_apply_callback():
+                element.run_apply_callback()
+        self._memory_cache.clear()
+    # ------------------------------------------------------------------
+    # Memory translation helpers
+    # ------------------------------------------------------------------
+
+    def _require_image(self) -> RadioImage:
+        if self._image is None:
+            raise errors.RadioError("Memory image not loaded")
+        return self._image
+
+    def get_memory(self, number: int):  # type: ignore[override]
+        image = self._require_image()
+        if not (0 <= number < len(image.channels)):
+            raise errors.RadioError(f"Memory index {number} out of range")
+        if number in self._memory_cache:
+            return self._memory_cache[number]
+        channel = image.channels[number]
+        mem = self._channel_to_memory(number, channel)
+        self._memory_cache[number] = mem
+        return mem
+
+    def set_memory(self, mem):  # type: ignore[override]
+        image = self._require_image()
+        if not (0 <= mem.number < len(image.channels)):
+            raise errors.RadioError(f"Memory index {mem.number} out of range")
+        channel = image.channels[mem.number]
+        self._apply_memory_to_channel(mem, channel)
+        sanitized = self._channel_to_memory(mem.number, channel)
+        for attr, value in sanitized.__dict__.items():
+            if attr.startswith('_'):
+                continue
+            object.__setattr__(mem, attr, value)
+        self._memory_cache[mem.number] = sanitized
+    # ------------------------------------------------------------------
+    # Conversion routines
+    # ------------------------------------------------------------------
+
+    def _channel_to_memory(self, number: int, channel: ChannelRecord):
+        mem = chirp_common.Memory()
+        mem.number = number
+        if channel.rx_hz is None:
+            mem.empty = True
+            return mem
+        mem.freq = channel.rx_hz
+        mem.empty = False
+        mem.name = (channel.name or "").strip()
+        self._apply_offset(mem, channel)
+        self._apply_tones(mem, channel)
+        if channel.rx_modulation is Modulation.AM:
+            mem.mode = "AM"
+        else:
+            mem.mode = "NFM" if channel.bandwidth is Bandwidth.NARROW else "FM"
+        mem.power = _POWER_ENUM_TO_CHIRP.get(channel.power, _CHIRP_POWER_LEVELS[0])
+        mem.skip = "" if channel.scan_add else "S"
+        mem.extra = _build_memory_extra(channel)
+        return mem
+
+    def _apply_offset(self, mem, channel: ChannelRecord) -> None:
+        if channel.tx_hz is None or channel.tx_hz == channel.rx_hz:
+            mem.duplex = ""
+            mem.offset = 0
+            return
+        diff = channel.tx_hz - channel.rx_hz
+        if diff > 0 and channel.tx_hz == channel.rx_hz + diff:
+            mem.duplex = "+"
+            mem.offset = abs(diff)
+        elif diff < 0 and channel.tx_hz == channel.rx_hz + diff:
+            mem.duplex = "-"
+            mem.offset = abs(diff)
+        else:
+            mem.duplex = "split"
+            mem.offset = channel.tx_hz
+
+    def _apply_tones(self, mem, channel: ChannelRecord) -> None:
+        tx = channel.tx_tone
+        rx = channel.rx_tone
+        # CHIRP's CSV exporter validates DtcsCode/RxDtcsCode even when
+        # tmode is not DTCS. Use a valid default (e.g. 023) instead of 000
+        # to avoid exporter errors.
+        default_dcs = chirp_common.DTCS_CODES[0]
+        mem.dtcs = default_dcs
+        mem.rx_dtcs = default_dcs
+        mem.dtcs_polarity = "NN"
+        if tx.is_off and rx.is_off:
+            mem.tmode = ""
+            return
+        if tx.mode is ToneMode.CTCSS and rx.is_off:
+            mem.tmode = "Tone"
+            mem.rtone = tx.ctcss_hz or 0.0
+            return
+        if tx.mode is ToneMode.CTCSS and rx.mode is ToneMode.CTCSS:
+            mem.tmode = "TSQL"
+            tone = tx.ctcss_hz or rx.ctcss_hz or 0.0
+            mem.rtone = tone
+            mem.ctone = tone
+            return
+        if tx.mode is ToneMode.DCS and tx.dcs_code is not None:
+            tx_pol = (tx.dcs_polarity or "N").upper()
+            if rx.mode is ToneMode.DCS and rx.dcs_code is not None:
+                mem.tmode = "DTCS"
+                mem.dtcs = tx.dcs_code
+                mem.rx_dtcs = rx.dcs_code
+                rx_pol = (rx.dcs_polarity or "N").upper()
+            else:
+                mem.tmode = "DTCS"
+                mem.dtcs = tx.dcs_code
+                mem.rx_dtcs = tx.dcs_code
+                rx_pol = "N"
+            mem.dtcs_polarity = tx_pol + rx_pol
+            return
+        if rx.mode is ToneMode.DCS and rx.dcs_code is not None:
+            mem.tmode = "DTCS"
+            mem.dtcs = rx.dcs_code
+            mem.rx_dtcs = rx.dcs_code
+            mem.dtcs_polarity = "N" + (rx.dcs_polarity or "N").upper()
+            return
+        mem.tmode = ""
+
+    def _apply_memory_to_channel(self, mem, channel: ChannelRecord) -> None:
+        if getattr(mem, "empty", False):
+            channel.rx_hz = None
+            channel.tx_hz = None
+            channel.name = ""
+            return
+        channel.rx_hz = mem.freq
+        if mem.duplex == "+":
+            channel.tx_hz = mem.freq + mem.offset
+        elif mem.duplex == "-":
+            channel.tx_hz = mem.freq - mem.offset
+        elif mem.duplex == "split":
+            channel.tx_hz = mem.offset
+        else:
+            channel.tx_hz = mem.freq
+        channel.name = (mem.name or "").strip()
+        self._update_tones_from_memory(mem, channel)
+
+        extras = _extract_memory_extra(mem)
+        scrambler_raw = extras.get('scrambler', getattr(mem, '_rt950_scrambler', None))
+        encryption_raw = extras.get('encryption', getattr(mem, '_rt950_encryption', None))
+        try:
+            channel.scrambler = int(scrambler_raw)
+        except (TypeError, ValueError):
+            channel.scrambler = 0
+        if channel.scrambler < 0 or channel.scrambler > 8:
+            channel.scrambler = 0
+        try:
+            channel.encryption = int(encryption_raw)
+        except (TypeError, ValueError):
+            channel.encryption = 0
+        if channel.encryption not in (0, 1, 2):
+            channel.encryption = 0
+        channel.learn_fhss = False
+        channel.fhss_code = None
+
+        mode = (mem.mode or "").upper()
+        if mode not in {"AM", "FM", "NFM"}:
+            mode = "AM" if channel.rx_modulation is Modulation.AM else "FM"
+
+        # Band-specific constraints
+        freq = channel.rx_hz or 0
+        in_airband = 118_000_000 <= freq <= 137_000_000
+        in_low_hf = 18_000_000 <= freq <= 64_000_000
+
+        if in_airband:
+            # Airband: AM only, TX disabled
+            channel.rx_modulation = Modulation.AM
+            channel.bandwidth = Bandwidth.WIDE
+            channel.tx_enabled = False
+        elif in_low_hf:
+            # Low HF: FM only
+            channel.rx_modulation = Modulation.FM
+            channel.bandwidth = Bandwidth.NARROW if mode == "NFM" else Bandwidth.WIDE
+        else:
+            # Default behavior for VHF/UHF
+            if mode == "AM":
+                channel.rx_modulation = Modulation.AM
+                channel.bandwidth = Bandwidth.WIDE
+            else:
+                channel.rx_modulation = Modulation.FM
+                channel.bandwidth = Bandwidth.NARROW if mode == "NFM" else Bandwidth.WIDE
+        if isinstance(mem.power, chirp_common.PowerLevel):
+            key = str(mem.power).upper()
+        elif isinstance(mem.power, str) and mem.power:
+            key = mem.power.upper()
+        else:
+            key = None
+        if key and key in _POWER_LABEL_TO_ENUM:
+            channel.power = _POWER_LABEL_TO_ENUM[key]
+        channel.scan_add = mem.skip != "S"
+
+    def _update_tones_from_memory(self, mem, channel: ChannelRecord) -> None:
+        # Normalise any invalid DTCS entries (e.g., code 000 from CSV/UI)
+        if getattr(mem, "tmode", "") == "DTCS":
+            tx_code = getattr(mem, "dtcs", 0) or 0
+            rx_code = getattr(mem, "rx_dtcs", tx_code) or tx_code
+            if tx_code == 0 or rx_code == 0:
+                mem.tmode = ""
+        if mem.tmode == "":
+            channel.tx_tone = channel.tx_tone.__class__.off()
+            channel.rx_tone = channel.rx_tone.__class__.off()
+        elif mem.tmode == "Tone":
+            channel.tx_tone = channel.tx_tone.__class__.ctcss(mem.rtone)
+            channel.rx_tone = channel.rx_tone.__class__.off()
+        elif mem.tmode == "TSQL":
+            tone = mem.ctone or mem.rtone
+            channel.tx_tone = channel.tx_tone.__class__.ctcss(mem.rtone or tone)
+            channel.rx_tone = channel.rx_tone.__class__.ctcss(mem.ctone or tone)
+        elif mem.tmode == "DTCS":
+            polarity = getattr(mem, "dtcs_polarity", "NN") or "NN"
+            tx_pol = polarity[0] if len(polarity) >= 1 else "N"
+            rx_pol = polarity[1] if len(polarity) >= 2 else tx_pol
+            tx_code = getattr(mem, "dtcs", 0) or 0
+            rx_code = getattr(mem, "rx_dtcs", tx_code) or tx_code
+            if tx_code:
+                channel.tx_tone = channel.tx_tone.__class__.dcs(tx_code, tx_pol)
+            else:
+                channel.tx_tone = channel.tx_tone.__class__.off()
+            if rx_code:
+                channel.rx_tone = channel.rx_tone.__class__.dcs(rx_code, rx_pol)
+            else:
+                channel.rx_tone = channel.rx_tone.__class__.off()
+
+__all__ = ["RT950ProRadio"]
+
+@directory.register
+class RT950ProDriver(RT950ProRadio):
+    """Monolithic wrapper for RT-950 Pro."""
+    pass
+
+DRIVER_CLASS = RT950ProDriver
