@@ -70,8 +70,9 @@ Source: "..\bridge_gui.py";              DestDir: "{app}"; Flags: ignoreversion
 Source: "..\icon.ico";                   DestDir: "{app}"; Flags: ignoreversion
 Source: "..\icon.png";                   DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md";                  DestDir: "{app}"; DestName: "README.md"; Flags: ignoreversion
-Source: "..\NEXT-STEPS.txt";             DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE";                    DestDir: "{app}"; Flags: ignoreversion
+; NEXT-STEPS.txt is shown inline on the final wizard page (InfoAfterFile) only --
+; not installed as a stray file the user has to go open.
 
 [Icons]
 ; --- GUI launcher (system-Python mode): windowed py launcher pinned to 3.10, so
@@ -84,7 +85,6 @@ Name: "{group}\RT-950 Pro Bridge"; Filename: "{app}\python310\pythonw.exe"; Para
 Name: "{autodesktop}\RT-950 Pro Bridge"; Filename: "{app}\python310\pythonw.exe"; Parameters: """{app}\bridge_gui.py"""; WorkingDir: "{app}"; IconFilename: "{app}\icon.ico"; Tasks: desktopicon; Check: UsePrivatePython
 ; --- Shared shortcuts ---
 Name: "{group}\RT-950 Driver Files"; Filename: "{app}"; IconFilename: "{app}\icon.ico"
-Name: "{group}\Next steps (com0com + CHIRP)"; Filename: "{app}\NEXT-STEPS.txt"
 Name: "{group}\Uninstall RT-950 Pro BLE"; Filename: "{uninstallexe}"
 
 [Registry]

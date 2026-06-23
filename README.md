@@ -15,14 +15,11 @@ Barguss (2E0NBS): <https://github.com/NathanBarguss/Chirp_Radtel-RT-950-Pro>.
 
 ## Pick your path
 
-```mermaid
-flowchart TD
-    A[What do you want to use?] --> B{Just CHIRP, simplest?}
-    B -- Yes --> C[radtel_rt950pro_BLE_int.py<br/>connects over BLE itself, NO bridge<br/>pick the radio from a list]
-    B -- No --> D{Need the Radtel CPS,<br/>or CHIRP via a cable-like bridge?}
-    D -- Yes --> E[Run the bridge GUI or CLI<br/>+ com0com v2.2.2 port pair<br/>CHIRP loads radtel_rt950pro_BL.py]
-    D -- "Don't want to fiddle" --> F[RT950-Setup.exe<br/>installs Python + packages + all files]
-```
+| Your situation | Use |
+|---|---|
+| **Just CHIRP, simplest** | `radtel_rt950pro_BLE_int.py` — no bridge, pick the radio from a list |
+| **The Radtel CPS, or CHIRP through a cable-like bridge** | the bridge (GUI or CLI) + a com0com v2.2.2 port pair; CHIRP loads `radtel_rt950pro_BL.py` |
+| **Don't want to set anything up** | `RT950-Setup.exe` |
 
 ## What's in the download
 
@@ -36,11 +33,24 @@ flowchart TD
 
 Grab `RT950-Setup.exe` from the
 [latest release](https://github.com/nivingoonesekera/Radtel-RT-950Pro-BLE-bridge-for-CHIRP-and-CPS/releases).
+It needs admin and (if you don't already have Python 3.10) an internet connection.
+It does **not** install com0com or CHIRP — see the two sections below for those.
+
+**Installer messages you might see (all normal):**
+
+| Message / code | What it means |
+|---|---|
+| Windows SmartScreen warns about the `.exe` | It's unsigned. **More info → Run anyway**. |
+| A Python step ends with code **3010** | "Reboot pending" — fine, carry on. |
+| A Python step ends with code **1603** | Python install failed — usually a pending reboot or a half-removed Python. Reboot and re-run. |
+| The `bleak`/`pyserial` step fails | You were offline — re-run with internet on. |
 
 ## Easiest way (CHIRP, no bridge)
 
-1. Install **Python 3.10** from <https://www.python.org/downloads/> (keep the
-   *py launcher* ticked), then run `pip install bleak`.
+1. Install **Python 3.10** (any 3.10.x patch — 3.10.4, 3.10.11, … all work; it
+   just has to be the 3.10 series, not 3.9 or 3.11) from
+   <https://www.python.org/downloads/> (keep the *py launcher* ticked), then run
+   `pip install bleak`.
 2. In CHIRP, enable `Help > Enable Developer Functions`.
 3. `Radio > Load Module` → **`radtel_rt950pro_BLE_int.py`**.
 4. `Radio > Download From Radio` → pick any COM port (it's ignored) → choose your

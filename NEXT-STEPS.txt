@@ -42,6 +42,8 @@ MESSAGES YOU MIGHT SEE DURING INSTALL (all normal)
 --------------------------------------------------
 - Windows SmartScreen warns about the .exe (it's unsigned): More info -> Run anyway.
 - A Python step finishing with code 3010 just means "reboot pending" — fine.
+- A Python step finishing with code 1603 = install failed (usually a pending
+  reboot or a half-removed Python): reboot and re-run.
 - If the package step fails, you were probably offline: re-run with internet on.
 
 
